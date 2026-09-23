@@ -27,10 +27,10 @@ def secret(name):
         return os.getenv(name, "")
 
 
-GROQ_KEY = secret("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")
-GEMINI_KEY = secret("AQ.Ab8RN6JtGdVf9VFtpeo2_7BYDuZQZZlhMIbQxKFX1noZ4UnTSQ")
-TELEGRAM_BOT_TOKEN = secret("8794257218:AAGYGDqPUEJdI3UahL07Pe86IgcLCfIn20g")
-TELEGRAM_CHAT_ID = secret("8600332637")
+GROQ_KEY = "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"
+GEMINI_KEY = "AQ.Ab8RN6JtGdVf9VFtpeo2_7BYDuZQZZlhMIbQxKFX1noZ4UnTSQ"
+TELEGRAM_BOT_TOKEN = "8794257218:AAGYGDqPUEJdI3UahL07Pe86IgcLCfIn20g"
+TELEGRAM_CHAT_ID = "8600332637"
 
 groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 # google-generativeai (old SDK) is deprecated; using the current google-genai SDK.
