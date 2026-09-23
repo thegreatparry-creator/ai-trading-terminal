@@ -1,1340 +1,308 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import plotly.graph_objects as go
+import email.utils
+import html as html_module
 import math
 import re
-import html as html_module
 import urllib.request
 import xml.etree.ElementTree as ET
-import email.utils
 from datetime import datetime, timezone, timedelta
-from groq import Groq
+
 import google.generativeai as genai
+import plotly.graph_objects as go
 import requests
+import streamlit as st
+import yfinance as yf
+from groq import Groq
 
 
-# ================== API KEYS ==================
-# Keep keys in .streamlit/secrets.toml only. Do not keep live secrets in git.
-def _get_secret(key, fallback):
+# ================== CONFIGURATION ==================
+st.set_page_config(page_title="AI Institutional Terminal", layout="wide")
+
+
+def secret(name):
     try:
-        return st.secrets[key]
+        return st.secrets.get(name, "")
     except Exception:
-        return fallback
-
-GEMINI_KEY = _get_secret("GEMINI_KEY", "")
-GROQ_KEY = _get_secret("GROQ_KEY", "")
-
-TELEGRAM_BOT_TOKEN = _get_secret("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = _get_secret("TELEGRAM_CHAT_ID", "")
+        return ""
 
 
-def send_telegram_alert(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        response = requests.post(url, json=data, timeout=5)
-        return response.status_code == 200
-    except Exception as e:
-        print(f"Telegram error: {e}")
-        return False
-
-
+GROQ_KEY = secret("GROQ_KEY")
+GEMINI_KEY = secret("GEMINI_KEY")
+TELEGRAM_BOT_TOKEN = secret("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = secret("TELEGRAM_CHAT_ID")
 groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
+NEWS_SOURCES = [
+    ("Moneycontrol", "https://www.moneycontrol.com/rss/latestnews.xml"),
+    ("Economic Times", "https://economictimes.indiatimes.com/markets/rssfeeds/1998028306.cms"),
+    ("MarketWatch", "https://feeds.marketwatch.com/marketwatch/topstories"),
+    ("CNBC", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline"),
+    ("Alpha Ideas", "https://alphaideas.in/feed"),
+    ("Cointelegraph", "https://cointelegraph.com/feed"),
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss"),
+    ("ForexLive", "https://www.forexlive.com/servicexml/xml.aspx?xml=1"),
+]
 
-# ================== AI MODEL MAPS ==================
-GROQ_MODEL_MAP = {
-    "Groq (GPT-OSS 20B - Fast)": "openai/gpt-oss-20b",
-    "Groq (GPT-OSS 120B - Smartest)": "openai/gpt-oss-120b",
-    "Groq (Qwen3 32B)": "qwen/qwen3-32b",
-    "Groq (Kimi K2)": "moonshotai/kimi-k2-instruct",
-}
-
-GEMINI_MODEL_MAP = {
-    "Gemini 3.5 Flash": "gemini-3.5-flash",
-    "Gemini 3.1 Pro (Preview)": "gemini-3.1-pro-preview",
-}
-
-
-# ================== PAGE CONFIG ==================
-st.set_page_config(page_title="AI Institutional Terminal", layout="wide")
-
-st.markdown(
-    """
-    <style>
-        html, body, [class*="css"] { font-size: 16px; }
-        h1 { font-size: 1.65rem !important; }
-        h2 { font-size: 1.3rem !important; }
-        h3 { font-size: 1.12rem !important; }
-        div[data-testid="stMetricValue"] { font-size: 1.3rem !important; }
-        div[data-testid="stMetricLabel"] { font-size: 0.82rem !important; }
-        .stButton>button { padding: 0.5rem 1rem; font-size: 1rem; border-radius: 8px; }
-
-        .news-card {
-            border: 1px solid rgba(150,150,150,0.25);
-            border-radius: 14px;
-            padding: 14px 16px;
-            margin-bottom: 12px;
-            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
-            box-shadow: 0 4px 10px rgba(0,0,0,0.04);
-        }
-        .news-card.bullish { border-color: rgba(28, 185, 120, 0.55); box-shadow: inset 0 0 0 1px rgba(28,185,120,0.15); }
-        .news-card.bearish { border-color: rgba(251, 78, 78, 0.55); box-shadow: inset 0 0 0 1px rgba(251,78,78,0.12); }
-        .news-card.neutral { border-color: rgba(255, 190, 75, 0.55); box-shadow: inset 0 0 0 1px rgba(255,190,75,0.1); }
-
-        .news-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
-        .news-badge {
-            display: inline-flex; align-items: center; justify-content: center;
-            padding: 5px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.02em;
-            border: 1px solid rgba(255,255,255,0.12);
-        }
-        .news-badge.bullish { background: rgba(21, 178, 93, 0.18); color: #4ade80; }
-        .news-badge.bearish { background: rgba(239, 68, 68, 0.18); color: #f87171; }
-        .news-badge.neutral { background: rgba(245, 158, 11, 0.18); color: #fbbf24; }
-        .news-score { font-size: 0.78rem; opacity: 0.8; }
-        .news-title { font-size: 1.04rem; font-weight: 700; line-height: 1.4; margin-bottom: 6px; }
-        .news-summary { font-size: 0.94rem; line-height: 1.55; opacity: 0.85; margin-bottom: 8px; }
-        .news-impact { font-size: 0.8rem; opacity: 0.78; margin-top: 7px; }
-        .news-meta { font-size: 0.78rem; opacity: 0.7; }
-        .news-meta a { text-decoration: none; }
-
-        .zone-card {
-            border-radius: 16px; padding: 16px; margin-top: 10px; border: 1px solid rgba(140,140,140,0.25);
-            background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
-            box-shadow: 0 6px 16px rgba(0,0,0,0.04);
-        }
-        .zone-card.bullish { border-color: rgba(48, 196, 122, 0.5); background: linear-gradient(180deg, rgba(34,197,94,0.08), rgba(255,255,255,0.02)); }
-        .zone-card.bearish { border-color: rgba(239,68,68,0.5); background: linear-gradient(180deg, rgba(239,68,68,0.08), rgba(255,255,255,0.02)); }
-        .zone-card.neutral { border-color: rgba(234,179,8,0.45); background: linear-gradient(180deg, rgba(234,179,8,0.08), rgba(255,255,255,0.02)); }
-        .zone-header { display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
-        .zone-title { font-weight: 700; font-size: 1rem; }
-        .zone-pill {
-            display:inline-flex; align-items:center; justify-content:center; padding:6px 10px; border-radius:999px;
-            font-size: 0.74rem; font-weight: 700; letter-spacing:0.03em;
-        }
-        .zone-pill.bullish { background: rgba(34,197,94,0.14); color: #4ade80; }
-        .zone-pill.bearish { background: rgba(239,68,68,0.14); color: #f87171; }
-        .zone-pill.neutral { background: rgba(234,179,8,0.14); color: #facc15; }
-        .zone-values { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; margin-top: 14px; }
-        .zone-stat { border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 10px 12px; background: rgba(0,0,0,0.04); }
-        .zone-stat-label { font-size: 0.72rem; opacity: 0.72; }
-        .zone-stat-value { font-size: 1rem; font-weight: 700; margin-top: 4px; }
-        .zone-summary { margin-top: 10px; font-size: 0.9rem; line-height: 1.5; opacity: 0.88; }
-
-        @media (max-width: 640px) {
-            h1 { font-size: 1.35rem !important; }
-            h2 { font-size: 1.15rem !important; }
-            .news-title { font-size: 1rem; }
-            .news-summary { font-size: 0.9rem; }
-            .zone-values { grid-template-columns: 1fr; }
-            .zone-header { align-items: flex-start; }
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+html,body,[class*="css"]{font-size:16px}.stButton>button{border-radius:8px;padding:.5rem 1rem}
+.news-card{border:1px solid rgba(150,150,150,.28);border-radius:14px;padding:15px 16px;margin:0 0 13px;background:rgba(255,255,255,.025)}
+.news-card.direct{border-left:5px solid #26a269}.news-card.indirect{border-left:5px solid #e8a317}
+.news-head{display:flex;justify-content:space-between;gap:10px;align-items:center}.news-title{font-size:1.05rem;font-weight:700;line-height:1.4;margin:7px 0}.news-summary,.news-reason{line-height:1.55;opacity:.88}.news-meta{font-size:.78rem;opacity:.68;margin-top:9px}.badge{padding:5px 10px;border-radius:99px;font-size:.75rem;font-weight:700}.green{background:#164d35;color:#6ee7a0}.yellow{background:#604811;color:#ffd166}.red{background:#5b2020;color:#ff8b8b}
+.zone{border:1px solid rgba(140,140,140,.3);border-radius:15px;padding:15px;margin:10px 0}.zone-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.stat{padding:9px;border-radius:9px;background:rgba(0,0,0,.08)}.small{font-size:.75rem;opacity:.7}.value{font-weight:700;margin-top:3px}
+@media(max-width:640px){h1{font-size:1.4rem!important}.zone-grid{grid-template-columns:1fr}.news-title{font-size:1rem}}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("🎯 AI Trading Terminal - PRO")
 
 
-def yahoo_symbol_search(query, max_results=8):
-    query = (query or "").strip()
-    if not query:
-        return []
+# ================== SYMBOL SELECTION ==================
+def yahoo_symbol_search(query, limit=8):
     try:
-        resp = requests.get(
-            "https://query2.finance.yahoo.com/v1/finance/search",
-            params={"q": query, "quotesCount": max_results, "newsCount": 0},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5,
-        )
-        resp.raise_for_status()
-        results = []
-        for q in resp.json().get("quotes", []):
-            symbol = q.get("symbol")
-            if not symbol:
-                continue
-            results.append(
-                {
-                    "symbol": symbol,
-                    "name": q.get("shortname") or q.get("longname") or symbol,
-                    "exchange": q.get("exchange", ""),
-                    "type": q.get("quoteType", ""),
-                }
-            )
-        return results
-    except Exception as e:
-        print(f"Symbol search error: {e}")
+        r = requests.get("https://query2.finance.yahoo.com/v1/finance/search", params={"q": query, "quotesCount": limit, "newsCount": 0}, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+        r.raise_for_status()
+        return [{"symbol": x.get("symbol"), "name": x.get("shortname") or x.get("longname") or x.get("symbol"), "exchange": x.get("exchange", ""), "type": x.get("quoteType", "")} for x in r.json().get("quotes", []) if x.get("symbol")]
+    except Exception:
         return []
 
 
-st.sidebar.header("🔍 Search Any Stock / Index / Crypto Worldwide")
-global_query = st.sidebar.text_input("Type a name or ticker — e.g. 'Nifty 50', 'Apple', 'Reliance', 'Bitcoin', 'EURUSD'", key="global_search_query")
-
-symbol_override = None
-if global_query.strip():
-    search_results = yahoo_symbol_search(global_query)
-    if search_results:
-        options = [f"{r['symbol']} — {r['name']} ({r['exchange']} · {r['type']})" for r in search_results]
-        picked = st.sidebar.radio("Matching symbols", options, key="global_search_pick")
-        symbol_override = search_results[options.index(picked)]["symbol"]
-    else:
-        st.sidebar.caption("No matches found. Try a different spelling, or use the manual selector below.")
-
-with st.sidebar.expander("⚙️ Manual selector (if you already know the exact suffix)", expanded=not bool(global_query.strip())):
-    select_market = st.selectbox(
-        "Asset Class / Country",
-        ["India - NSE (.NS)", "India Index Benchmark", "United States (No Suffix)", "Cryptocurrency (-USD)", "Forex Currency (=X)", "Commodities", "Global Indices"],
-    )
-
-    default_symbol = "RELIANCE"
-    if select_market == "India Index Benchmark":
-        default_symbol = "^NSEI"
-    elif select_market == "United States (No Suffix)":
-        default_symbol = "AAPL"
-    elif select_market == "Cryptocurrency (-USD)":
-        default_symbol = "BTC-USD"
-    elif select_market == "Forex Currency (=X)":
-        default_symbol = "EURUSD=X"
-    elif select_market == "Commodities":
-        default_symbol = "GC=F"
-    elif select_market == "Global Indices":
-        default_symbol = "^GSPC"
-    else:
-        default_symbol = "RELIANCE"
-
-    search_ticker = st.text_input("Enter Ticker / Symbol", default_symbol).strip().upper()
-
-    if select_market == "India - NSE (.NS)" and not search_ticker.endswith(".NS"):
-        manual_symbol = f"{search_ticker}.NS"
-    elif select_market == "Cryptocurrency (-USD)" and not search_ticker.endswith("-USD"):
-        manual_symbol = f"{search_ticker}-USD"
-    elif select_market == "Forex Currency (=X)" and not search_ticker.endswith("=X"):
-        manual_symbol = f"{search_ticker}=X"
-    elif select_market == "Commodities" and not search_ticker.endswith("=F"):
-        manual_symbol = f"{search_ticker}=F"
-    else:
-        manual_symbol = search_ticker
-
-if symbol_override:
-    full_symbol = symbol_override
-    search_ticker = symbol_override
+st.sidebar.header("🔍 Search Any Stock / Index / Crypto")
+query = st.sidebar.text_input("Company name or ticker", "RELIANCE", key="global_search_query").strip().upper()
+results = yahoo_symbol_search(query) if query else []
+if results:
+    choices = [f"{x['symbol']} — {x['name']} ({x['exchange']} · {x['type']})" for x in results]
+    selected = st.sidebar.radio("Matching symbols", choices, key="global_search_pick")
+    symbol = results[choices.index(selected)]["symbol"]
 else:
-    full_symbol = manual_symbol
+    market = st.sidebar.selectbox("Market", ["India - NSE (.NS)", "United States", "Crypto", "Forex", "Commodities"])
+    raw = st.sidebar.text_input("Exact ticker", query).strip().upper()
+    suffix = {"India - NSE (.NS)": ".NS", "Crypto": "-USD", "Forex": "=X", "Commodities": "=F"}.get(market, "")
+    symbol = raw if (not suffix or raw.endswith(suffix)) else raw + suffix
 
 st.sidebar.markdown("---")
-st.sidebar.header("📡 Global News Sources")
-global_news_sources = [
-    "https://www.moneycontrol.com/rss/latestnews.xml",
-    "https://alphaideas.in/feed",
-    "https://economictimes.indiatimes.com/markets/rssfeeds/1998028306.cms",
-    "https://feeds.marketwatch.com/marketwatch/topstories",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "https://feeds.finance.yahoo.com/rss/2.0/headline",
-    "https://cointelegraph.com/feed",
-    "https://www.coindesk.com/arc/outboundfeeds/rss",
-    "https://www.forexlive.com/servicexml/xml.aspx?xml=1",
-]
-
-sentiment_filter = st.sidebar.multiselect(
-    "Filter News by Sentiment",
-    ["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"],
-    default=["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"],
-)
-
-st.sidebar.markdown("---")
-st.sidebar.header("🚀 Optional Features")
-enable_fundamentals = st.sidebar.checkbox("📊 Enhanced Fundamentals", value=False)
+sentiment_filter = st.sidebar.multiselect("Sentiment filter", ["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"], default=["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"])
 
 
-# ================== WATCHLIST ==================
-if "watchlists" not in st.session_state:
-    st.session_state.watchlists = {"My Stocks": ["RELIANCE.NS", "TCS.NS", "INFY.NS"], "Watchlist 2": ["AAPL", "NVDA"], "Crypto": ["BTC-USD", "ETH-USD"]}
-if "current_watchlist" not in st.session_state:
-    st.session_state.current_watchlist = "My Stocks"
-
-st.sidebar.markdown("---")
-st.sidebar.header("📋 Watchlists")
-new_list_name = st.sidebar.text_input("New Watchlist Name")
-if st.sidebar.button("➕ Create Watchlist"):
-    if new_list_name and new_list_name not in st.session_state.watchlists:
-        st.session_state.watchlists[new_list_name] = []
-        st.rerun()
-
-selected_watchlist = st.sidebar.selectbox(
-    "Select Watchlist",
-    list(st.session_state.watchlists.keys()),
-    index=list(st.session_state.watchlists.keys()).index(st.session_state.current_watchlist),
-)
-st.session_state.current_watchlist = selected_watchlist
-
-new_stock = st.sidebar.text_input("Add Stock Ticker")
-if st.sidebar.button("➕ Add to Watchlist"):
-    if new_stock and new_stock not in st.session_state.watchlists[selected_watchlist]:
-        st.session_state.watchlists[selected_watchlist].append(new_stock)
-        st.rerun()
-
-if st.session_state.watchlists[selected_watchlist]:
-    st.sidebar.markdown("### Current Watchlist:")
-    for idx, stock in enumerate(st.session_state.watchlists[selected_watchlist]):
-        col1, col2 = st.sidebar.columns([3, 1])
-        col1.write(f"{idx+1}. {stock}")
-        if col2.button("🗑️", key=f"remove_{idx}"):
-            st.session_state.watchlists[selected_watchlist].remove(stock)
-            st.rerun()
-
-st.sidebar.markdown("---")
-st.sidebar.header("📱 Telegram Alerts")
-if st.sidebar.button("🧪 Test Telegram Alert"):
-    test_msg = f"🧪 <b>TEST ALERT</b>\n\n✅ Telegram working!\n🕐 {datetime.now().strftime('%H:%M:%S')}"
-    if send_telegram_alert(test_msg):
-        st.sidebar.success("✅ Test sent!")
-    else:
-        st.sidebar.error("❌ Failed")
+# ================== DATA ==================
+def clean_text(value):
+    text = html_module.unescape(re.sub(r"<[^>]+>", " ", value or ""))
+    return re.sub(r"\s+", " ", text).strip()
 
 
-# ================== HELPER FUNCTIONS ==================
-def clean_news_summary(raw_html, max_sentences=3, max_chars=240):
-    if not raw_html:
-        return ""
-    text = re.sub(r"<[^<]+?>", " ", raw_html)
-    text = html_module.unescape(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return ""
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    text = " ".join(sentences[:max_sentences]).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
-    return text
+def parse_news_time(value):
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return datetime.now(timezone.utc) - timedelta(days=7)
 
 
-def harvest_global_news():
-    news_items = []
-    for url in global_news_sources:
+@st.cache_data(ttl=180, show_spinner=False)
+def harvest_news():
+    """Read a fresh, wide pool from every configured source and remove duplicates."""
+    unique = {}
+    for source_name, url in NEWS_SOURCES:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                root = ET.fromstring(resp.read())
-                for item in root.findall(".//item")[:8]:
-                    title = (item.findtext("title", "") or "").strip()
-                    link = (item.findtext("link", "") or "").strip()
-                    pub = (item.findtext("pubDate", "") or "").strip()
-                    raw_desc = item.findtext("description", "") or ""
-                    summary = clean_news_summary(raw_desc) or title
-                    source = item.find("source").text.strip() if item.find("source") is not None else "Global News"
-                    is_breaking = False
-                    try:
-                        dt = email.utils.parsedate_to_datetime(pub)
-                        if (datetime.now(timezone.utc) - dt).total_seconds() <= 86400:
-                            is_breaking = True
-                    except Exception:
-                        is_breaking = "hours ago" in pub.lower() or "min ago" in pub.lower()
-                    score = 0
-                    title_lower = title.lower()
-                    for w in ["soars", "jumps", "beats", "rally", "buy", "gain", "rise"]:
-                        if w in title_lower:
-                            score += 1
-                    for w in ["slumps", "falls", "drops", "loss", "sell", "crash", "decline"]:
-                        if w in title_lower:
-                            score -= 1
-                    score = max(-3, min(3, score))
-                    news_items.append({
-                        "title": title,
-                        "summary": summary,
-                        "link": link,
-                        "source": source,
-                        "time": pub,
-                        "impact": score,
-                        "is_breaking": is_breaking,
-                    })
-        except Exception as e:
-            print(f"News source error: {e}")
-    return news_items[:60]
-
-
-def get_relevance_keywords(search_ticker, stock_info):
-    raw = re.sub(r"(\.NS|-USD|=X|=F)$", "", (search_ticker or "")).strip().lower()
-    keywords = {raw} if raw else set()
-    name = (stock_info or {}).get("longName") or (stock_info or {}).get("shortName") or ""
-    if name:
-        name_lower = name.lower()
-        keywords.add(name_lower)
-        words = [w for w in re.findall(r"[a-z0-9]+", name_lower) if len(w) > 2]
-        keywords.update(words)
-        first_word = words[0] if words else ""
-        if first_word:
-            keywords.add(first_word)
-    if raw:
-        for alias in [raw.replace("-usd", ""), raw.replace(".ns", "")]:
-            if alias:
-                keywords.add(alias)
-    return [k for k in keywords if k and len(k) > 1]
-
-
-def filter_relevant_news(news_list, keywords, max_items=8):
-    if not keywords:
-        return []
-    scored = []
-    for n in news_list:
-        haystack = f"{n['title']} {n.get('summary', '')}".lower()
-        hits = sum(1 for k in keywords if k in haystack)
-        if hits > 0:
-            scored.append((hits, n))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [n for _, n in scored][:max_items]
-
-
-def classify_news_sentiment(score):
-    if score >= 6.5:
-        return "Bullish", "bullish", 1
-    elif score <= 3.5:
-        return "Bearish", "bearish", -1
-    return "Neutral", "neutral", 0
-
-
-def score_news_for_stock(news_item, keywords):
-    text = f"{news_item.get('title', '')} {news_item.get('summary', '')}".lower()
-    if not text:
-        return {"score": 5.0, "sentiment": "Neutral", "tone": "neutral", "reason": "No article text available."}
-
-    ticker_hits = sum(1 for k in keywords if k and k in text)
-    bullish_terms = [
-        "beat", "beats", "rally", "surge", "upbeat", "growth", "higher", "strong", "upgrade", "outperform",
-        "buy", "demand", "expansion", "profit", "record", "revenue", "earnings beat", "guidance raised",
-        "gains", "rises", "jumps", "breakout", "bullish", "acceleration", "innovation"
-    ]
-    bearish_terms = [
-        "miss", "misses", "drop", "slumps", "weak", "decline", "downgrade", "sell", "pressure", "loss",
-        "lower", "risk", "warning", "cuts", "revenue miss", "margin pressure", "fall", "crash", "bearish",
-        "concern", "slip", "underperform"
-    ]
-
-    bullish_weight = sum(1 for term in bullish_terms if term in text)
-    bearish_weight = sum(1 for term in bearish_terms if term in text)
-
-    base_score = (ticker_hits * 2.2) + bullish_weight * 1.5 - bearish_weight * 1.7
-    score = max(0.0, min(10.0, 5.0 + base_score))
-    sentiment, tone, direction = classify_news_sentiment(score)
-
-    if direction > 0:
-        reason = "This headline is favorable for the stock, with positive operating or market commentary."
-    elif direction < 0:
-        reason = "This headline introduces a risk or negative catalyst for the stock."
-    else:
-        reason = "This headline is broadly balanced and likely has limited directional impact for the stock."
-
-    if ticker_hits == 0:
-        score = 5.0
-        sentiment, tone, direction = "Neutral", "neutral", 0
-        reason = "This article is not clearly about the selected stock, so it is treated as neutral."
-
-    return {"score": round(score, 1), "sentiment": sentiment, "tone": tone, "reason": reason}
-
-
-def render_news_card(news_item, keywords):
-    scored = score_news_for_stock(news_item, keywords)
-    sentiment = scored["sentiment"]
-    tone = scored["tone"]
-    score = scored["score"]
-    explanation = scored["reason"]
-    color = "bullish" if tone == "bullish" else "bearish" if tone == "bearish" else "neutral"
-
-    title_safe = html_module.escape(news_item.get("title", ""))
-    summary_safe = html_module.escape(news_item.get("summary", ""))
-    source_safe = html_module.escape(news_item.get("source", "Global News"))
-    time_safe = html_module.escape(news_item.get("time", ""))
-    link = news_item.get("link", "#")
-
-    st.markdown(
-        f"""
-        <div class="news-card {color}">
-          <div class="news-head">
-            <div class="news-badge {color}">{sentiment}</div>
-            <div class="news-score">{score:.1f}/10</div>
-          </div>
-          <div class="news-title">{title_safe}</div>
-          <div class="news-summary">{summary_safe}</div>
-          <div class="news-impact">📊 Impact: {html_module.escape(explanation)}</div>
-          <div class="news-meta">📌 {source_safe} · 📅 {time_safe} · <a href="{link}" target="_blank">Read full story →</a></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def detect_patterns(df):
-    if len(df) < 3:
-        return "Insufficient"
-    c, o = df["Close"].values, df["Open"].values
-    if c[-1] > o[-1] and c[-2] < o[-2] and c[-1] >= o[-2]:
-        return "🔥 Bullish Engulfing"
-    elif c[-1] < o[-1] and c[-2] > o[-2] and c[-1] <= o[-2]:
-        return "⚠️ Bearish Engulfing"
-    return "Standard"
-
-
-def calculate_levels(df, first_15m_open=None):
-    if first_15m_open is None or isinstance(first_15m_open, str):
-        first_15m_open = float(df["Close"].iloc[-1])
-    else:
-        first_15m_open = float(first_15m_open)
-
-    sqrt_price = math.sqrt(abs(first_15m_open))
-    gann_levels = {}
-    for deg, delta in [(22.5, 22.5 / 180), (45, 45 / 180), (67.5, 67.5 / 180), (90, 90 / 180), (180, 180 / 180)]:
-        gann_levels[f"R_{deg}"] = math.pow(sqrt_price + delta, 2)
-        gann_levels[f"S_{deg}"] = math.pow(sqrt_price - delta, 2)
-
-    high, low, close = float(df["High"].iloc[-1]), float(df["Low"].iloc[-1]), float(df["Close"].iloc[-1])
-    pivot = (high + low + close) / 3
-
-    return {
-        "price": close,
-        "pivot": round(pivot, 2),
-        "r1": round((2 * pivot) - low, 2),
-        "r2": round(pivot + (high - low), 2),
-        "r3": round(high + 2 * (pivot - low), 2),
-        "r4": round(high + 3 * (pivot - low), 2),
-        "s1": round((2 * pivot) - high, 2),
-        "s2": round(pivot - (high - low), 2),
-        "s3": round(low - 2 * (high - pivot), 2),
-        "s4": round(low - 3 * (high - pivot), 2),
-        "pattern": detect_patterns(df),
-        **gann_levels,
-    }
-
-
-def build_gann_ladder(quant, open_price):
-    degs = [22.5, 45, 67.5, 90, 180]
-    ladder = [{"label": "0° (Open)", "deg": 0.0, "side": "OPEN", "value": float(open_price)}]
-    for d in degs:
-        r_val, s_val = quant.get(f"R_{d}"), quant.get(f"S_{d}")
-        if r_val is not None:
-            ladder.append({"label": f"{d}° R", "deg": d, "side": "R", "value": float(r_val)})
-        if s_val is not None:
-            ladder.append({"label": f"{d}° S", "deg": d, "side": "S", "value": float(s_val)})
-    ladder.sort(key=lambda x: x["value"])
-    return ladder
-
-
-def locate_price_band(ladder, price):
-    if not ladder:
-        return "below"
-    if price <= ladder[0]["value"]:
-        return "below"
-    if price >= ladder[-1]["value"]:
-        return "above"
-    for i in range(len(ladder) - 1):
-        if ladder[i]["value"] <= price <= ladder[i + 1]["value"]:
-            return ladder[i], ladder[i + 1]
-    return "below"
-
-
-def get_chart_zoom_window(ladder, band, price, context=1):
-    if not ladder:
-        return None
-    if isinstance(band, tuple):
-        lo_idx, hi_idx = ladder.index(band[0]), ladder.index(band[1])
-    else:
-        lo_idx, hi_idx = 0, len(ladder) - 1
-    start = max(0, lo_idx - context)
-    end = min(len(ladder) - 1, hi_idx + context)
-    window = ladder[start : end + 1]
-    window_vals = [lvl["value"] for lvl in window] + [price]
-    y_min, y_max = min(window_vals), max(window_vals)
-    pad = (y_max - y_min) * 0.18 if y_max > y_min else max(abs(price) * 0.01, 0.0001)
-    return y_min - pad, y_max + pad, window
-
-
-def detect_order_block(price_df, lookback=60, impulse_atr_mult=1.8, search_back=6):
-    if price_df is None or len(price_df) < 15:
-        return None
-    d = price_df.tail(lookback).copy()
-    d["body"] = (d["Close"] - d["Open"]).abs()
-    d["range"] = d["High"] - d["Low"]
-    atr = d["range"].rolling(14, min_periods=5).mean()
-    bullish_ob, bearish_ob = None, None
-    for i in range(len(d) - 2, 0, -1):
-        a = atr.iloc[i]
-        if pd.isna(a) or a == 0:
-            continue
-        if d["body"].iloc[i] <= impulse_atr_mult * a:
-            continue
-        moved_up = d["Close"].iloc[i] > d["Open"].iloc[i]
-        moved_down = d["Close"].iloc[i] < d["Open"].iloc[i]
-        if moved_up and bullish_ob is None:
-            for j in range(i - 1, max(i - search_back, -1), -1):
-                if d["Close"].iloc[j] < d["Open"].iloc[j]:
-                    bullish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j]), "time": d.index[j]}
-                    break
-        if moved_down and bearish_ob is None:
-            for j in range(i - 1, max(i - search_back, -1), -1):
-                if d["Close"].iloc[j] > d["Open"].iloc[j]:
-                    bearish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j]), "time": d.index[j]}
-                    break
-        if bullish_ob and bearish_ob:
-            break
-    if not bullish_ob and not bearish_ob:
-        return None
-    return {"bullish": bullish_ob, "bearish": bearish_ob}
-
-
-def detect_golden_pocket(price_df, lookback=80):
-    if price_df is None or len(price_df) < 15:
-        return None
-    d = price_df.tail(lookback)
-    swing_high, swing_low = float(d["High"].max()), float(d["Low"].min())
-    diff = swing_high - swing_low
-    if diff <= 0:
-        return None
-    uptrend = d["Low"].idxmin() < d["High"].idxmax()
-    if uptrend:
-        gp_low, gp_high = swing_high - diff * 0.65, swing_high - diff * 0.618
-    else:
-        gp_low, gp_high = swing_low + diff * 0.618, swing_low + diff * 0.65
-    return {"gp_low": gp_low, "gp_high": gp_high, "swing_high": swing_high, "swing_low": swing_low, "uptrend": uptrend}
-
-
-def get_15min_data(symbol):
-    try:
-        stock = yf.Ticker(symbol)
-        df_15m = stock.history(period="5d", interval="15m")
-        if df_15m.empty:
-            return None, None
-        today = datetime.now().date()
-        df_15m = df_15m[df_15m.index.date >= today - timedelta(days=2)]
-        return df_15m, float(df_15m["Open"].iloc[0]) if len(df_15m) > 0 else None
-    except Exception:
-        return None, None
-
-
-def get_historical_15min_days(symbol, days=2):
-    try:
-        stock = yf.Ticker(symbol)
-        df_15m = stock.history(period=f"{days}d", interval="15m")
-        if df_15m.empty:
-            return []
-        df_15m["Date"] = df_15m.index.date
-        daily_data = []
-        for date in sorted(df_15m["Date"].unique(), reverse=True)[:2]:
-            day_df = df_15m[df_15m["Date"] == date]
-            if len(day_df) < 5:
-                continue
-            opening = float(day_df["Open"].iloc[0])
-            high, low, close = float(day_df["High"].max()), float(day_df["Low"].min()), float(day_df["Close"].iloc[-1])
-            pivot = (high + low + close) / 3
-            sqrt_open = math.sqrt(abs(opening))
-            levels = {}
-            for deg, delta in [(22.5, 22.5 / 180), (45, 45 / 180), (67.5, 67.5 / 180), (90, 90 / 180), (180, 180 / 180)]:
-                levels[f"R_{deg}"] = math.pow(sqrt_open + delta, 2)
-                levels[f"S_{deg}"] = math.pow(sqrt_open - delta, 2)
-            daily_data.append(
-                {
-                    "Date": date,
-                    "Open": opening,
-                    "High": high,
-                    "Low": low,
-                    "Close": close,
-                    "Pivot": round(pivot, 2),
-                    "R1": round((2 * pivot) - low, 2),
-                    "R2": round(pivot + (high - low), 2),
-                    "R3": round(high + 2 * (pivot - low), 2),
-                    "R4": round(high + 3 * (pivot - low), 2),
-                    "S1": round((2 * pivot) - high, 2),
-                    "S2": round(pivot - (high - low), 2),
-                    "S3": round(low - 2 * (high - pivot), 2),
-                    "S4": round(low - 3 * (high - pivot), 2),
-                    **levels,
-                }
-            )
-        return daily_data
-    except Exception:
-        return []
-
-
-def get_groq_suggestions(symbol, quant, news_dossier):
-    if groq_client is None:
-        return "⚠️ AI Error (Groq): API key not configured. Add GROQ_KEY in .streamlit/secrets.toml."
-    prompt = f"Analyze {symbol}: Price={quant['price']}, Pattern={quant['pattern']}, R1={quant['r1']}, S1={quant['s1']}\nNews: {news_dossier}\n\nGive INTRADAY and SWING suggestions with ENTRY, SL, TP."
-    try:
-        res = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return res.choices[0].message.content
-    except Exception as e:
-        return f"⚠️ AI Error (Groq): {type(e).__name__}: {e}"
-
-
-def get_chat_response(user_message, context_text, model_choice):
-    system_prompt = f"Trading assistant. Context: {context_text}. Answer questions. Educational only."
-    try:
-        if model_choice in GROQ_MODEL_MAP:
-            if groq_client is None:
-                return "⚠️ AI Error (Groq): API key not configured. Add GROQ_KEY in .streamlit/secrets.toml."
-            response = groq_client.chat.completions.create(
-                model=GROQ_MODEL_MAP[model_choice],
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
-                temperature=0.3,
-                max_tokens=800,
-            )
-            return response.choices[0].message.content
-        elif model_choice in GEMINI_MODEL_MAP:
-            if not GEMINI_KEY:
-                return "⚠️ AI Error (Gemini): API key not configured. Add GEMINI_KEY in .streamlit/secrets.toml."
-            model = genai.GenerativeModel(GEMINI_MODEL_MAP[model_choice])
-            response = model.generate_content(f"{system_prompt}\n\nQ: {user_message}")
-            return response.text
-        else:
-            return "⚠️ Invalid model selected"
-    except Exception as e:
-        return f"⚠️ AI Error ({model_choice}): {type(e).__name__}: {e}"
-
-
-def run_backtest(symbol, start_date, end_date, strategy):
-    try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(start=start_date, end=end_date, interval="1d")
-        if df.empty:
-            return None
-        trades = []
-        for i in range(20, len(df)):
-            pivot = (df["High"].iloc[i - 1] + df["Low"].iloc[i - 1] + df["Close"].iloc[i - 1]) / 3
-            s1, r1 = (2 * pivot) - df["High"].iloc[i - 1], (2 * pivot) - df["Low"].iloc[i - 1]
-            if strategy == "Buy at S1" and df["Low"].iloc[i] <= s1:
-                trades.append((s1, pivot))
-            elif strategy == "Sell at R1" and df["High"].iloc[i] >= r1:
-                trades.append((r1, pivot))
-        if not trades:
-            return {"win_rate": 0, "avg_profit": 0, "total_trades": 0}
-        wins = sum(1 for e, x in trades if x > e)
-        return {
-            "win_rate": (wins / len(trades)) * 100,
-            "avg_profit": sum(x - e for e, x in trades) / len(trades),
-            "total_trades": len(trades),
-            "total_profit": sum(x - e for e, x in trades),
-        }
-    except Exception:
-        return None
+            with urllib.request.urlopen(req, timeout=6) as response:
+                root = ET.fromstring(response.read())
+            for item in root.findall(".//item")[:20]:
+                title = clean_text(item.findtext("title", ""))
+                link = (item.findtext("link", "") or "").strip()
+                summary = clean_text(item.findtext("description", ""))
+                published = (item.findtext("pubDate", "") or "").strip()
+                if not title:
+                    continue
+                key = link or re.sub(r"[^a-z0-9]", "", title.lower())
+                unique.setdefault(key, {"title": title, "summary": summary or title, "link": link, "source": source_name, "published": published, "published_dt": parse_news_time(published)})
+        except Exception as exc:
+            print(f"News source error ({source_name}): {exc}")
+    return list(unique.values())
 
 
 @st.cache_data(ttl=120)
-def get_cached_stock_data(symbol):
+def stock_data(ticker):
     try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(period="3mo", interval="1d")
-        info = stock.info
-        return df, info
+        t = yf.Ticker(ticker)
+        return t.history(period="3mo", interval="1d"), t.info or {}
     except Exception:
-        return pd.DataFrame(), {}
+        return None, {}
 
 
-@st.cache_data(ttl=300)
-def get_cached_global_news():
-    return harvest_global_news()
+def stock_keywords(ticker, info):
+    raw = re.sub(r"(\.NS|-USD|=X|=F)$", "", ticker.lower())
+    name = (info.get("longName") or info.get("shortName") or "").lower()
+    words = re.findall(r"[a-z0-9]+", name)
+    values = {raw, name, *[w for w in words if len(w) >= 3]}
+    return [x for x in values if x and len(x) >= 2]
 
 
-@st.cache_data(ttl=60)
-def get_cached_15min_data(symbol):
-    return get_15min_data(symbol)
+def related_sector_keywords(ticker, info):
+    text = f"{ticker} {info.get('longName','')} {info.get('sector','')} {info.get('industry','')}".lower()
+    groups = {
+        "technology": ["technology", "software", "cloud", "semiconductor", "chip", "it services", "artificial intelligence", "ai"],
+        "financial": ["bank", "banking", "finance", "nbfc", "interest rate", "credit", "loan", "insurance"],
+        "energy": ["oil", "gas", "energy", "refinery", "crude", "lng", "solar", "renewable"],
+        "automotive": ["auto", "automobile", "vehicle", "ev", "electric vehicle", "car", "motorcycle"],
+        "pharma": ["pharma", "drug", "medicine", "healthcare", "fda", "clinical", "biotech"],
+        "consumer": ["consumer", "retail", "fmcg", "inflation", "discretionary"],
+        "metals": ["metal", "steel", "aluminium", "copper", "iron ore", "mining"],
+        "crypto": ["crypto", "bitcoin", "ethereum", "blockchain", "digital asset"],
+    }
+    found = set()
+    for sector, words in groups.items():
+        if any(word in text for word in words):
+            found.update(words)
+    return list(found)
 
 
-@st.cache_data(ttl=600)
-def get_cached_historical(symbol, days):
-    return get_historical_15min_days(symbol, days)
+def relevance_and_importance(item, direct_keys, indirect_keys):
+    text = f"{item['title']} {item['summary']}".lower()
+    direct_hits = sum(1 for k in direct_keys if k in text)
+    indirect_hits = sum(1 for k in indirect_keys if k in text)
+    catalyst = ["earnings", "revenue", "profit", "guidance", "regulator", "lawsuit", "acquisition", "merger", "tariff", "rate", "inflation", "sanction", "upgrade", "downgrade", "contract", "default", "warning", "forecast", "results"]
+    catalyst_hits = sum(1 for word in catalyst if word in text)
+    age_hours = max(0.0, (datetime.now(timezone.utc) - item["published_dt"]).total_seconds() / 3600)
+    freshness = max(0.0, 10.0 - min(age_hours / 3.0, 10.0))
+    source_weight = {"Reuters": 2.0, "CNBC": 1.7, "Economic Times": 1.5, "Moneycontrol": 1.4, "Yahoo Finance": 1.4, "MarketWatch": 1.3}.get(item["source"], 1.0)
+    direct = direct_hits > 0
+    related = direct or indirect_hits > 0
+    importance = min(100.0, 42 * min(direct_hits, 2) + 14 * min(indirect_hits, 3) + 7 * min(catalyst_hits, 3) + freshness + source_weight * 4)
+    if not related:
+        return None
+    item = dict(item)
+    item.update({"direct": direct, "direct_hits": direct_hits, "indirect_hits": indirect_hits, "importance": round(importance, 1), "freshness": freshness})
+    return item
 
 
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
-if "quant_data" not in st.session_state:
-    st.session_state.quant_data = None
-if "portfolio" not in st.session_state:
-    st.session_state.portfolio = {}
-if "alerts" not in st.session_state:
-    st.session_state.alerts = []
-
-with st.spinner("🔄 Loading market data..."):
-    df, stock_info = get_cached_stock_data(full_symbol)
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Live Analysis", "💬 AI Chat", "📊 Market Heatmap", "📋 Watchlist & Portfolio", "🔔 Alerts & Backtest", "📅 Historical Data"
-])
-
-with tab1:
-    st.header(f"📊 Live Analysis: {full_symbol}")
-    if df.empty or len(df) < 5:
-        st.error(f"❌ No data for {full_symbol}. Use the universal search box in the sidebar to find the right symbol (e.g. search 'Nifty 50' instead of typing NIFTY.NS).")
+def deterministic_impact(item, ticker, info):
+    text = f"{item['title']} {item['summary']}".lower()
+    positive = ["beat", "growth", "profit", "upgrade", "strong", "rises", "surge", "record", "contract", "expansion", "demand", "guidance raised"]
+    negative = ["miss", "loss", "downgrade", "weak", "falls", "drop", "lawsuit", "warning", "cuts", "default", "pressure", "guidance cut"]
+    p, n = sum(w in text for w in positive), sum(w in text for w in negative)
+    score = max(0.0, min(10.0, 5 + p * 1.4 - n * 1.6))
+    if score >= 6.5:
+        tone, label = "green", "Bullish"
+    elif score <= 3.5:
+        tone, label = "red", "Bearish"
     else:
-        df_15m, opening_15m = get_cached_15min_data(full_symbol)
-        quant = calculate_levels(df, opening_15m)
-        st.session_state.quant_data = quant
-        news_list = get_cached_global_news()
-        chart_df = df_15m if (df_15m is not None and not df_15m.empty) else df
+        tone, label = "yellow", "Neutral"
+    if item["direct"]:
+        reason = f"Direct catalyst: this article mentions {ticker} or its company name, so it can affect earnings, valuation, demand, or risk sentiment directly."
+    else:
+        sector = info.get("sector") or info.get("industry") or "the company’s industry"
+        reason = f"Indirect catalyst: this story concerns {sector} or a related macro factor. It can affect {ticker} through demand, input costs, rates, regulation, currency, or investor risk appetite."
+    return {"score": round(score, 1), "label": label, "tone": tone, "reason": reason}
 
-        col_main, col_ai = st.columns([2, 1], gap="large")
 
-        with col_main:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("💰 Current Price", f"{quant['price']:.2f}")
-            c2.metric("📊 Pattern", quant["pattern"])
-            c3.metric("📈 Pivot", f"{quant['pivot']:.2f}")
+def ai_indirect_explanations(items, ticker, info):
+    """Ask the configured model to improve explanations for indirect stories in one call."""
+    if not groq_client or not items:
+        return {}
+    payload = "\n".join(f"{i}: {x['title']} — {x['summary']}" for i, x in enumerate(items))
+    prompt = f"For stock {ticker} ({info.get('longName','')}), explain why each indirectly related news item may affect the stock. Return one concise line per item in the exact format INDEX|EXPLANATION. Do not invent facts. Items:\n{payload}"
+    try:
+        response = groq_client.chat.completions.create(model="openai/gpt-oss-20b", messages=[{"role": "user", "content": prompt}], temperature=0.1, max_tokens=900)
+        explanations = {}
+        for line in response.choices[0].message.content.splitlines():
+            match = re.match(r"\s*(\d+)\s*[|:-]\s*(.+)", line)
+            if match:
+                explanations[int(match.group(1))] = match.group(2).strip()
+        return explanations
+    except Exception as exc:
+        print(f"News explanation error: {exc}")
+        return {}
 
-            st.markdown("---")
-            st.subheader("🎯 Live Price Position on Gann Ladder")
-            st.caption("0° = the opening price of the first 15-min candle. Every other degree is calculated from that anchor.")
 
-            open_ref = opening_15m if opening_15m else quant["price"]
-            ladder = build_gann_ladder(quant, open_ref)
-            band = locate_price_band(ladder, quant["price"])
+def render_news(item):
+    impact = item["impact"]
+    st.markdown(f"""
+    <div class="news-card {'direct' if item['direct'] else 'indirect'}">
+      <div class="news-head"><span class="badge {impact['tone']}">{'DIRECT' if item['direct'] else 'INDIRECT'} · {impact['label']}</span><b>Importance {item['importance']:.0f}/100 · Impact {impact['score']:.1f}/10</b></div>
+      <div class="news-title">{html_module.escape(item['title'])}</div>
+      <div class="news-summary">{html_module.escape(item['summary'])}</div>
+      <div class="news-reason">🧠 <b>Why it matters:</b> {html_module.escape(impact['reason'])}</div>
+      <div class="news-meta">📌 {html_module.escape(item['source'])} · 🕒 {html_module.escape(item['published'])} · <a href="{html_module.escape(item['link'])}" target="_blank">Read source →</a></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-            if band == "below":
-                st.warning(f"⬇️ Price **{quant['price']:.2f}** is BELOW every calculated level (lowest = {ladder[0]['label']} @ {ladder[0]['value']:.2f}) — possible breakdown zone.")
-            elif band == "above":
-                st.warning(f"⬆️ Price **{quant['price']:.2f}** is ABOVE every calculated level (highest = {ladder[-1]['label']} @ {ladder[-1]['value']:.2f}) — possible breakout zone.")
-            else:
-                lo, hi = band
-                st.success(f"💰 Price **{quant['price']:.2f}** is between **{lo['label']}** ({lo['value']:.2f}) and **{hi['label']}** ({hi['value']:.2f})")
-                span = hi["value"] - lo["value"]
-                pct_into_band = ((quant["price"] - lo["value"]) / span) if span else 0.0
-                st.progress(min(max(pct_into_band, 0.0), 1.0), text=f"{pct_into_band * 100:.1f}% of the way from {lo['label']} to {hi['label']}")
 
-            if chart_df is not None and not chart_df.empty:
-                zoom = get_chart_zoom_window(ladder, band, quant["price"], context=1)
-                fig = go.Figure(
-                    data=[
-                        go.Candlestick(
-                            x=chart_df.index,
-                            open=chart_df["Open"],
-                            high=chart_df["High"],
-                            low=chart_df["Low"],
-                            close=chart_df["Close"],
-                            name=full_symbol,
-                        )
-                    ]
-                )
-                if zoom:
-                    y_min, y_max, visible_levels = zoom
-                    for lvl in visible_levels:
-                        color = "#26a69a" if lvl["side"] == "S" else ("#1e88e5" if lvl["side"] == "OPEN" else "#ef5350")
-                        fig.add_hline(
-                            y=lvl["value"],
-                            line_dash="dash",
-                            line_width=1.6,
-                            line_color=color,
-                            opacity=0.9,
-                            annotation_text=f"{lvl['label']}  {lvl['value']:.2f}",
-                            annotation_position="left",
-                            annotation_font_size=12,
-                            annotation_bgcolor="rgba(255,255,255,0.75)",
-                        )
-                    if isinstance(band, tuple):
-                        fig.add_hrect(y0=band[0]["value"], y1=band[1]["value"], fillcolor="#ffe08a", opacity=0.18, line_width=0)
-                    fig.update_yaxes(range=[y_min, y_max])
-                fig.update_layout(
-                    height=460,
-                    xaxis_rangeslider_visible=False,
-                    margin=dict(l=10, r=100, t=30, b=10),
-                    title=f"{full_symbol} — zoomed to the current band (0° anchor = {open_ref:.2f})",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.caption("No candle data available to draw the chart right now.")
+# ================== ANALYSIS ==================
+df, info = stock_data(symbol)
+if df is None or df.empty:
+    st.error(f"No market data found for {symbol}.")
+    st.stop()
 
-            st.markdown("---")
-            st.subheader("🧠 Smart Money Zones")
+price = float(df["Close"].iloc[-1])
+news = harvest_news()
+keys = stock_keywords(symbol, info)
+indirect_keys = related_sector_keywords(symbol, info)
+ranked_news = []
+for article in news:
+    ranked = relevance_and_importance(article, keys, indirect_keys)
+    if ranked:
+        ranked["impact"] = deterministic_impact(ranked, symbol, info)
+        ranked_news.append(ranked)
+ranked_news.sort(key=lambda x: (x["importance"], x["published_dt"]), reverse=True)
 
-            def render_zone_card(title, label, tone, low, high, current_price, summary):
-                tone_class = tone if tone in ["bullish", "bearish", "neutral"] else "neutral"
-                inside = low <= current_price <= high
-                st.markdown(
-                    f"""
-                    <div class="zone-card {tone_class}">
-                      <div class="zone-header">
-                        <div class="zone-title">{title}</div>
-                        <div class="zone-pill {tone_class}">{label}</div>
-                      </div>
-                      <div class="zone-values">
-                        <div class="zone-stat">
-                          <div class="zone-stat-label">Current</div>
-                          <div class="zone-stat-value">{current_price:.2f}</div>
-                        </div>
-                        <div class="zone-stat">
-                          <div class="zone-stat-label">Low</div>
-                          <div class="zone-stat-value">{low:.2f}</div>
-                        </div>
-                        <div class="zone-stat">
-                          <div class="zone-stat-label">High</div>
-                          <div class="zone-stat-value">{high:.2f}</div>
-                        </div>
-                      </div>
-                      <div class="zone-summary">{summary} {('Price is currently inside this zone.' if inside else 'Price is outside this zone right now.')}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+indirect = [x for x in ranked_news if not x["direct"]][:10]
+for idx, explanation in ai_indirect_explanations(indirect, symbol, info).items():
+    if 0 <= idx < len(indirect):
+        indirect[idx]["impact"]["reason"] = explanation
 
-            ob = detect_order_block(chart_df)
-            price = quant["price"]
-            if ob:
-                if ob.get("bullish"):
-                    lo_ob, hi_ob = ob["bullish"]["low"], ob["bullish"]["high"]
-                    render_zone_card(
-                        "📦 Bullish Order Block",
-                        "Bullish",
-                        "bullish",
-                        lo_ob,
-                        hi_ob,
-                        price,
-                        f"Demand zone detected around {lo_ob:.2f} to {hi_ob:.2f}.",
-                    )
-                if ob.get("bearish"):
-                    lo_ob, hi_ob = ob["bearish"]["low"], ob["bearish"]["high"]
-                    render_zone_card(
-                        "📦 Bearish Order Block",
-                        "Bearish",
-                        "bearish",
-                        lo_ob,
-                        hi_ob,
-                        price,
-                        f"Supply zone detected around {lo_ob:.2f} to {hi_ob:.2f}.",
-                    )
-            else:
-                st.caption("No clear recent order block detected in this window.")
+# ================== TABS ==================
+tab_live, tab_news, tab_chat = st.tabs(["📊 Live Analysis", "📰 Ranked Stock News", "💬 AI Chat"])
+with tab_live:
+    st.header(f"📊 {symbol}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current Price", f"{price:.2f}")
+    c2.metric("Company", info.get("longName", symbol))
+    c3.metric("Related stories", len(ranked_news))
+    chart = go.Figure(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name=symbol))
+    chart.update_layout(height=460, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=35, b=10))
+    st.plotly_chart(chart, use_container_width=True)
+    st.info("The chart is kept simple and responsive. News and smart-money interpretation are shown in the dedicated cards below.")
 
-            gp = detect_golden_pocket(chart_df)
-            if gp:
-                price = quant["price"]
-                inside = gp["gp_low"] <= price <= gp["gp_high"]
-                direction = "pullback in an uptrend" if gp["uptrend"] else "bounce in a downtrend"
-                tone = "bullish" if gp["uptrend"] else "bearish"
-                label = "Bullish" if gp["uptrend"] else "Bearish"
-                render_zone_card(
-                    "🌀 Golden Pocket (61.8%–65% Fib)",
-                    label,
-                    tone,
-                    gp["gp_low"],
-                    gp["gp_high"],
-                    price,
-                    f"This is the key fib retracement area for a {direction}.",
-                )
-            else:
-                st.caption("Not enough recent data to compute a golden pocket.")
+    st.subheader("🧠 Smart Money Zones")
+    recent = df.tail(60).copy()
+    if len(recent) >= 15:
+        high, low = float(recent["High"].max()), float(recent["Low"].min())
+        gp_low, gp_high = low + (high-low)*.618, low + (high-low)*.65
+        tone = "Bullish" if recent["Close"].iloc[-1] >= recent["Close"].iloc[0] else "Bearish"
+        st.markdown(f"<div class='zone'><b>🌀 Golden Pocket · {tone}</b><div class='zone-grid'><div class='stat'><div class='small'>Current</div><div class='value'>{price:.2f}</div></div><div class='stat'><div class='small'>Zone low</div><div class='value'>{gp_low:.2f}</div></div><div class='stat'><div class='small'>Zone high</div><div class='value'>{gp_high:.2f}</div></div></div><p>Retracement zone calculated from the recent swing range. {'Price is inside the zone.' if gp_low <= price <= gp_high else 'Price is outside the zone.'}</p></div>", unsafe_allow_html=True)
+    else:
+        st.caption("Not enough data for smart-money zones.")
 
-            st.markdown("---")
-            st.markdown("### 🎯 Price Position Relative to Levels")
-            price_positions = []
-            for level_key in ["r4", "r3", "r2", "r1", "s1", "s2", "s3", "s4"]:
-                val = quant.get(level_key)
-                try:
-                    level_val = float(val) if val is not None else 0.0
-                except (ValueError, TypeError):
-                    level_val = 0.0
-                if level_key.startswith("r"):
-                    position = "ABOVE" if price > level_val else "BELOW" if price < level_val else "AT"
-                else:
-                    position = "BELOW" if price < level_val else "ABOVE" if price > level_val else "AT"
-                price_positions.append({"Level": level_key.upper(), "Value": f"${level_val:.2f}", "Position": position})
-            st.dataframe(pd.DataFrame(price_positions), use_container_width=True)
+with tab_news:
+    st.header(f"📰 Latest Relevant News — {symbol}")
+    st.caption("Fresh pool from all configured feeds. Articles are deduplicated, relevance-ranked, then sorted by importance and freshness. Direct stories appear before indirect sector or macro catalysts.")
+    show_indirect = st.checkbox("Include indirect sector/macro news", True)
+    limit = st.slider("Number of ranked stories", 5, 30, 12)
+    shown = [x for x in ranked_news if show_indirect or x["direct"]]
+    shown = [x for x in shown if ((x["impact"]["label"] == "Bullish" and "🟢 Bullish" in sentiment_filter) or (x["impact"]["label"] == "Bearish" and "🔴 Bearish" in sentiment_filter) or (x["impact"]["label"] == "Neutral" and "🟡 Neutral" in sentiment_filter))]
+    if shown:
+        for item in shown[:limit]:
+            render_news(item)
+    else:
+        st.warning("No relevant stories matched the current filters. Try including indirect news or enabling all sentiments.")
 
-            st.markdown("### 🎯 Traditional Pivot Levels")
-            pivot_rows = []
-            for level in ["4", "3", "2", "1"]:
-                r_raw = quant.get(f"r{level}")
-                s_raw = quant.get(f"s{level}")
-                try:
-                    r_val = float(r_raw) if r_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    r_val = 0.0
-                try:
-                    s_val = float(s_raw) if s_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    s_val = 0.0
-                pivot_rows.append({"Resistance": r_val, "Support": s_val})
-            levels_df = pd.DataFrame(pivot_rows, index=["Level 4", "Level 3", "Level 2", "Level 1"])
-            st.dataframe(levels_df, use_container_width=True)
-
-        with col_ai:
-            st.subheader("💡 AI Trading Suggestions")
-            news_text = "\n".join([n["title"] for n in news_list[:5]]) if news_list else "No news"
-            if st.button("🚀 Generate AI Suggestions", use_container_width=True):
-                with st.spinner("AI analyzing..."):
-                    st.session_state["last_ai_suggestion"] = get_groq_suggestions(full_symbol, quant, news_text)
-            last = st.session_state.get("last_ai_suggestion")
-            if last:
-                if last.startswith("⚠️"):
-                    st.error(last)
-                else:
-                    st.markdown(last)
-            else:
-                st.caption("Click the button to get an INTRADAY + SWING read on this ticker.")
-
-        st.markdown("---")
-        st.subheader(f"📰 News on {full_symbol}")
-
-        def sentiment_allowed(news_item):
-            impact = news_item["impact"]
-            if impact > 0:
-                return "🟢 Bullish" in sentiment_filter
-            elif impact < 0:
-                return "🔴 Bearish" in sentiment_filter
-            return "🟡 Neutral" in sentiment_filter
-
-        keywords = get_relevance_keywords(search_ticker, stock_info)
-        stock_news = [n for n in filter_relevant_news(news_list, keywords, max_items=12) if sentiment_allowed(n)]
-        used_fallback = False
-        if not stock_news:
-            used_fallback = True
-            stock_news = [n for n in news_list if sentiment_allowed(n)][:5]
-
-        if used_fallback:
-            st.info(f"No headlines in the current feeds specifically mention {full_symbol} right now — showing the strongest general market news instead.")
-
-        if stock_news:
-            ranked = []
-            for n in stock_news:
-                score_info = score_news_for_stock(n, keywords)
-                ranked.append({**n, **score_info})
-            ranked.sort(key=lambda x: x["score"], reverse=True)
-            for item in ranked[:8]:
-                render_news_card(item, keywords)
+with tab_chat:
+    st.header("💬 AI Chat")
+    prompt = st.chat_input("Ask about the stock or the ranked news...")
+    if prompt:
+        if not groq_client:
+            st.warning("Add GROQ_KEY to .streamlit/secrets.toml to use AI chat.")
         else:
-            st.info("No news matching your current sentiment filters.")
-
-
-with tab2:
-    st.header("💬 AI Chat Assistant")
-    st.markdown("**Ask about:** Stock analysis, levels, news, strategy, market outlook")
-    model = st.selectbox("Choose Model", list(GROQ_MODEL_MAP.keys()) + list(GEMINI_MODEL_MAP.keys()))
-
-    if "chat_context" not in st.session_state:
-        st.session_state.chat_context = ""
-
-    if st.session_state.quant_data:
-        q = st.session_state.quant_data
-        st.session_state.chat_context = f"Ticker: {full_symbol}, Price: {q['price']}, R1: {q['r1']}, S1: {q['s1']}, Pattern: {q['pattern']}"
-
-    if not st.session_state.chat_context:
-        st.warning("⚠️ Analysis data not ready. Please wait for Tab 1 to load.")
-    else:
-        for msg in st.session_state.chat_messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        if prompt := st.chat_input("Ask about stock, levels, news, strategy..."):
-            st.session_state.chat_messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            with st.chat_message("assistant"):
-                with st.spinner(f"AI thinking... ({model})"):
-                    response = get_chat_response(prompt, st.session_state.chat_context, model)
-                    if response and not response.startswith("⚠️"):
-                        st.markdown(response)
-                    else:
-                        st.error(response or "❌ AI Error - Try a different model or check your API keys")
-                st.session_state.chat_messages.append({"role": "assistant", "content": response})
-
-        if st.button("🗑️ Clear Chat"):
-            st.session_state.chat_messages = []
-            st.rerun()
-
-
-with tab3:
-    subtab1, subtab2 = st.tabs(["📊 Sector Performance", "🔥 Stock Heatmap"])
-    with subtab1:
-        st.header("📊 Sector Performance Heatmap")
-        sector_indices = {
-            "India - NSE (.NS)": {"NIFTY Bank": "^NSEBANK", "NIFTY IT": "^CNXIT", "NIFTY Auto": "^CNXAUTO", "NIFTY FMCG": "^CNXFMCG", "NIFTY Pharma": "^CNXPHARMA", "NIFTY Metal": "^CNXMETAL"},
-            "United States (No Suffix)": {"S&P 500 Tech": "XLK", "S&P 500 Bank": "XLF", "S&P 500 Health": "XLV", "S&P 500 Consumer": "XLP", "S&P 500 Energy": "XLE"},
-            "Global Indices": {"S&P 500": "^GSPC", "Nasdaq": "^IXIC", "Dow Jones": "^DJI", "DAX": "^GDAXI", "FTSE": "^FTSE", "Nikkei": "^N225"},
-            "Commodities": {"Gold": "GC=F", "Silver": "SI=F", "Oil": "CL=F", "Natural Gas": "NG=F", "Copper": "HG=F"},
-            "Cryptocurrency (-USD)": {"BTC": "BTC-USD", "ETH": "ETH-USD", "BNB": "BNB-USD", "SOL": "SOL-USD", "XRP": "XRP-USD"},
-        }
-        sectors = sector_indices.get(select_market, {"General": "^GSPC"})
-        sector_data = []
-        for sector_name, symbol in sectors.items():
+            context = "\n".join(f"{x['title']} | {x['impact']['reason']}" for x in ranked_news[:10])
             try:
-                ticker = yf.Ticker(symbol)
-                info = ticker.info
-                price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-                change = info.get("regularMarketChangePercent", 0)
-                intensity = min(10, abs(change) / 0.5)
-                color_bars = "🟢" * int(intensity) if change > 0 else "🔴" * int(intensity)
-                sector_data.append({"Sector": sector_name, "Price": price, "Change %": change, "Intensity": f"{intensity:.1f}/10", "Visual": color_bars if color_bars else "⚪"})
-            except Exception:
-                pass
-        if sector_data:
-            df_sectors = pd.DataFrame(sector_data).sort_values("Change %", ascending=False)
-            for _, row in df_sectors.iterrows():
-                col1, col2, col3 = st.columns([2, 1, 2])
-                with col1:
-                    st.markdown(f"### {row['Visual']} {row['Sector']}")
-                with col2:
-                    st.metric("Price", f"${row['Price']:.2f}")
-                with col3:
-                    st.metric("Change", f"{row['Change %']:.2f}%", f"{row['Change %']:.2f}%")
-                st.markdown("---")
-        else:
-            st.warning("Could not fetch sector data")
+                answer = groq_client.chat.completions.create(model="openai/gpt-oss-20b", messages=[{"role":"system", "content": f"You are a careful financial news assistant for {symbol}. Explain direct and indirect catalysts. Educational only. Context:\n{context}"}, {"role":"user", "content": prompt}], temperature=.2, max_tokens=900).choices[0].message.content
+                st.markdown(answer)
+            except Exception as exc:
+                st.error(f"AI error: {exc}")
 
-    with subtab2:
-        st.header("🔥 Stock Heatmap - Intensity View")
-        sector_stocks = {
-            "India - NSE (.NS)": {
-                "Banking": ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS", "AXISBANK.NS"],
-                "IT": ["TCS.NS", "INFY.NS", "HCLTECH.NS", "WIPRO.NS", "TECHM.NS"],
-                "Auto": ["MARUTI.NS", "TATAMOTORS.NS", "M&M.NS", "BAJAJ-AUTO.NS"],
-                "FMCG": ["ITC.NS", "HINDUNILVR.NS", "NESTLEIND.NS", "BRITANNIA.NS"],
-                "Pharma": ["SUNPHARMA.NS", "DRREDDY.NS", "DIVISLAB.NS", "CIPLA.NS"],
-                "Energy": ["RELIANCE.NS", "ONGC.NS", "BPCL.NS", "IOC.NS"],
-                "Metal": ["TATASTEEL.NS", "HINDALCO.NS", "JSWSTEEL.NS", "ADANIENT.NS"],
-            },
-            "United States (No Suffix)": {
-                "Tech Giants": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMZN"],
-                "Banking": ["JPM", "BAC", "WFC", "GS", "MS"],
-                "Healthcare": ["JNJ", "UNH", "PFE", "MRK", "ABBV"],
-                "Consumer": ["WMT", "PG", "KO", "PEP", "COST"],
-                "Auto": ["TSLA", "F", "GM", "RIVN"],
-            },
-            "Cryptocurrency (-USD)": {
-                "Top 10": ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "AVAX-USD", "DOGE-USD", "TRX-USD", "DOT-USD"],
-                "DeFi": ["UNI-USD", "LINK-USD", "AAVE-USD", "MKR-USD", "COMP-USD"],
-                "Layer 2": ["MATIC-USD", "ARB-USD", "OP-USD", "LRC-USD"],
-            },
-            "Commodities": {
-                "Metals": ["GC=F", "SI=F", "PL=F", "PA=F"],
-                "Energy": ["CL=F", "NG=F", "HO=F", "RB=F"],
-                "Agriculture": ["ZC=F", "ZW=F", "ZS=F", "KC=F"],
-            },
-            "Forex Currency (=X)": {
-                "Major Pairs": ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X"],
-                "Commodity Pairs": ["AUDUSD=X", "USDCAD=X", "NZDUSD=X"],
-                "Emerging Markets": ["USDINR=X", "USDBRL=X", "USDMXN=X"],
-            },
-        }
-        market_sectors = sector_stocks.get(select_market, sector_stocks.get("India - NSE (.NS)", {}))
-        selected_sector = st.selectbox("Select Sector", list(market_sectors.keys()))
-        stocks_list = market_sectors[selected_sector]
-        heatmap_data = []
-        for stock in stocks_list:
-            try:
-                ticker = yf.Ticker(stock)
-                info = ticker.info
-                price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-                change = info.get("regularMarketChangePercent", 0)
-                intensity = min(10, abs(change) / 0.3)
-                if change > 0:
-                    color_bars = "🟢" * int(intensity) + "⚫" * (10 - int(intensity))
-                elif change < 0:
-                    color_bars = "🔴" * int(intensity) + "⚫" * (10 - int(intensity))
-                else:
-                    color_bars = "⚪" * 10
-                heatmap_data.append(
-                    {
-                        "Stock": stock.replace(".NS", "").replace("-USD", "").replace("=F", "").replace("=X", ""),
-                        "Price": price,
-                        "Change %": change,
-                        "Intensity": f"{intensity:.1f}/10",
-                        "Color Bars": color_bars,
-                    }
-                )
-            except Exception:
-                pass
-        if heatmap_data:
-            df_heatmap = pd.DataFrame(heatmap_data).sort_values("Change %", ascending=False)
-            for _, row in df_heatmap.iterrows():
-                col1, col2, col3 = st.columns([2, 1, 2])
-                with col1:
-                    st.markdown(f"### {row['Color Bars']} {row['Stock']}")
-                with col2:
-                    st.metric("Price", f"${row['Price']:.2f}")
-                with col3:
-                    st.metric("Change", f"{row['Change %']:.2f}%", f"{row['Change %']:.2f}%")
-                st.markdown("---")
-        else:
-            st.warning("Could not fetch stock data")
-
-
-with tab4:
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.header("📋 Watchlist Overview")
-        if not st.session_state.watchlists:
-            st.warning("No watchlists")
-        else:
-            for list_name, stocks in st.session_state.watchlists.items():
-                st.markdown(f"### 📋 {list_name}")
-                if stocks:
-                    cols = st.columns(min(len(stocks), 3))
-                    for idx, stock in enumerate(stocks):
-                        try:
-                            ticker = yf.Ticker(stock)
-                            info = ticker.info
-                            price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-                            change = info.get("regularMarketChangePercent", 0)
-                            with cols[idx % len(cols)]:
-                                st.metric(stock, f"{price:.2f}" if price else "N/A", f"{change:.2f}%" if change else "0.00%")
-                        except Exception:
-                            with cols[idx % len(cols)]:
-                                st.metric(stock, "N/A", "0.00%")
-                st.markdown("---")
-    with col2:
-        st.header("💼 Portfolio Tracker")
-        st.subheader("➕ Add Holding")
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            portfolio_stock = st.text_input("Ticker", key="pf_stock")
-        with col_b:
-            portfolio_qty = st.number_input("Qty", min_value=1, value=10, key="pf_qty")
-        with col_c:
-            portfolio_buy_price = st.number_input("Price", min_value=0.01, value=100.0, key="pf_price")
-        if st.button("Add to Portfolio"):
-            if portfolio_stock:
-                st.session_state.portfolio[portfolio_stock] = {"qty": portfolio_qty, "buy_price": portfolio_buy_price}
-                st.rerun()
-        if st.session_state.portfolio:
-            st.subheader("📊 Your Holdings")
-            total_invested, total_current = 0, 0
-            for stock, data in st.session_state.portfolio.items():
-                try:
-                    ticker = yf.Ticker(stock)
-                    current_price = ticker.info.get("currentPrice") or 0
-                    invested = data["qty"] * data["buy_price"]
-                    current = data["qty"] * current_price
-                    pnl = current - invested
-                    pnl_pct = (pnl / invested) * 100 if invested > 0 else 0
-                    total_invested += invested
-                    total_current += current
-                    st.markdown(f"### {stock}")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Qty", data["qty"])
-                    c2.metric("Buy", f"${data['buy_price']:.2f}")
-                    c3.metric("Current", f"${current_price:.2f}")
-                    c4.metric("P&L", f"${pnl:.2f}", f"{pnl_pct:.2f}%")
-                    if st.button(f"🗑️", key=f"remove_pf_{stock}"):
-                        del st.session_state.portfolio[stock]
-                        st.rerun()
-                except Exception:
-                    st.error(f"Could not fetch {stock}")
-            total_pnl = total_current - total_invested
-            total_pnl_pct = (total_pnl / total_invested) * 100 if total_invested > 0 else 0
-            st.markdown("### 💰 Total Portfolio")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Invested", f"${total_invested:.2f}")
-            c2.metric("Current", f"${total_current:.2f}")
-            c3.metric("P&L", f"${total_pnl:.2f}", f"{total_pnl_pct:.2f}%")
-
-
-with tab5:
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.header("🔔 Price Alerts")
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            alert_stock = st.text_input("Ticker", key="alert_stock")
-        with col_b:
-            alert_price = st.number_input("Price", min_value=0.01, key="alert_price")
-        with col_c:
-            alert_type = st.selectbox("Type", ["Above", "Below"], key="alert_type")
-        if st.button("Create Alert"):
-            if alert_stock:
-                st.session_state.alerts.append({"stock": alert_stock, "price": alert_price, "type": alert_type, "active": True})
-                st.rerun()
-        if st.session_state.alerts:
-            st.subheader("📋 Active Alerts")
-            for idx, alert in enumerate(st.session_state.alerts):
-                if alert["active"]:
-                    try:
-                        ticker = yf.Ticker(alert["stock"])
-                        current = ticker.info.get("currentPrice") or 0
-                        triggered = (alert["type"] == "Above" and current >= alert["price"]) or (alert["type"] == "Below" and current <= alert["price"])
-                        if triggered:
-                            st.error(f"🚨 {alert['stock']} {alert['type']} ${alert['price']}! Current: ${current:.2f}")
-                            if st.button(f"✅ Ack", key=f"ack_{idx}"):
-                                st.session_state.alerts[idx]["active"] = False
-                        else:
-                            st.info(f"⏰ {alert['stock']} {alert['type']} ${alert['price']} | Current: ${current:.2f}")
-                            if st.button(f"🗑️", key=f"del_alert_{idx}"):
-                                st.session_state.alerts.pop(idx)
-                                st.rerun()
-                    except Exception:
-                        st.warning(f"Could not fetch {alert['stock']}")
-    with col2:
-        st.header("🧪 Backtesting")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            bt_symbol = st.text_input("Ticker", value="RELIANCE.NS")
-        with col_b:
-            strategy = st.selectbox("Strategy", ["Buy at S1", "Sell at R1"])
-        start_date = st.date_input("Start", value=datetime.now() - timedelta(days=90))
-        end_date = st.date_input("End", value=datetime.now())
-        if st.button("🚀 Run Backtest"):
-            with st.spinner(f"Testing {strategy}..."):
-                result = run_backtest(bt_symbol, start_date, end_date, strategy)
-                if result:
-                    st.success("✅ Complete!")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Trades", result["total_trades"])
-                    c2.metric("Win %", f"{result['win_rate']:.1f}%")
-                    c3.metric("Avg $", f"${result['avg_profit']:.2f}")
-                    c4.metric("Total $", f"${result['total_profit']:.2f}")
-                else:
-                    st.error("Failed")
-
-
-with tab6:
-    st.header("📅 Historical 15m Data (Last 2 Days)")
-    historical = get_cached_historical(full_symbol, 2)
-    if not historical:
-        st.warning("No historical data")
-    else:
-        for day in historical:
-            st.markdown(f"### 📅 {day['Date']}")
-            st.metric("Opening Price", f"${day['Open']:.2f}")
-            st.markdown("#### 🎯 Gann Angle Levels")
-            gann_rows = []
-            for deg in ["22.5°", "45°", "67.5°", "90°", "180°"]:
-                r_key = f'R_{deg.replace("°", "")}'
-                s_key = f'S_{deg.replace("°", "")}'
-                r_raw = day.get(r_key)
-                s_raw = day.get(s_key)
-                try:
-                    r_val = float(r_raw) if r_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    r_val = 0.0
-                try:
-                    s_val = float(s_raw) if s_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    s_val = 0.0
-                gann_rows.append({"Angle": deg, "Resistance": r_val, "Support": s_val})
-            gann_hist_df = pd.DataFrame(gann_rows)
-            st.dataframe(gann_hist_df, use_container_width=True)
-            st.markdown("#### 🎯 Traditional Pivot Levels")
-            pivot_rows = []
-            for level in ["4", "3", "2", "1"]:
-                r_raw = day.get(f"R{level}")
-                s_raw = day.get(f"S{level}")
-                try:
-                    r_val = float(r_raw) if r_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    r_val = 0.0
-                try:
-                    s_val = float(s_raw) if s_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    s_val = 0.0
-                pivot_rows.append({"Resistance": r_val, "Support": s_val})
-            pivot_hist_df = pd.DataFrame(pivot_rows, index=["Level 4", "Level 3", "Level 2", "Level 1"])
-            st.dataframe(pivot_hist_df, use_container_width=True)
-            st.markdown("#### 📊 Day Summary")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Open", f"${day['Open']:.2f}")
-            c2.metric("High", f"${day['High']:.2f}")
-            c3.metric("Low", f"${day['Low']:.2f}")
-            c4.metric("Close", f"${day['Close']:.2f}")
-            st.markdown("---")
+st.caption("News relevance and sentiment are heuristic/AI-assisted and are not investment advice.")
