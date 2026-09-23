@@ -51,179 +51,163 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Main background */
+    /* ========== GLOBAL ========== */
     .stApp {
-        background-color: #020617;
+        background-color: #020617 !important;
         color: #f8fafc;
     }
-    
-    /* Hide default Streamlit branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    
-    /* Cards */
+    #MainMenu, footer, header {visibility: hidden;}
+
+    /* ========== CARDS ========== */
     .card {
-        background: rgba(15, 23, 42, 0.7);
-        border: 1px solid rgba(51, 65, 85, 0.5);
+        background: #0F172A;
+        border: 1px solid rgba(51, 65, 85, 0.45);
         border-radius: 16px;
-        padding: 1.25rem;
+        padding: 1.25rem 1.4rem;
         margin-bottom: 1rem;
-        backdrop-filter: blur(8px);
     }
-    
     .card-header {
-        font-size: 1.15rem;
+        font-size: 1.1rem;
         font-weight: 700;
         color: #f8fafc;
-        margin-bottom: 0.25rem;
+        margin-bottom: 0.15rem;
+        letter-spacing: -0.01em;
     }
-    
     .card-sub {
-        font-size: 0.8rem;
-        color: #94a3b8;
-        margin-bottom: 1rem;
+        font-size: 0.78rem;
+        color: #64748b;
+        margin-bottom: 0.9rem;
     }
-    
-    /* Metric style */
+
+    /* ========== METRICS ========== */
     .metric-label {
-        font-size: 0.7rem;
+        font-size: 0.68rem;
         font-weight: 500;
         color: #64748b;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.06em;
     }
-    
     .metric-value {
-        font-size: 1.5rem;
+        font-size: 1.45rem;
         font-weight: 700;
         color: #f8fafc;
         font-variant-numeric: tabular-nums;
+        line-height: 1.2;
     }
-    
     .up { color: #34d399 !important; }
     .down { color: #f87171 !important; }
     .amber { color: #fbbf24 !important; }
-    
-    /* Buttons */
+
+    /* ========== BUTTONS ========== */
     .stButton > button {
-        border-radius: 10px;
-        font-weight: 600;
-        border: 1px solid rgba(51, 65, 85, 0.6);
-        background: rgba(30, 41, 59, 0.8);
-        color: #e2e8f0;
-        transition: all 0.15s ease;
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+        border: 1px solid rgba(51, 65, 85, 0.55) !important;
+        background: #1E293B !important;
+        color: #e2e8f0 !important;
+        transition: all 0.15s ease !important;
     }
-    
     .stButton > button:hover {
-        border-color: #fbbf24;
-        color: #fbbf24;
+        border-color: #fbbf24 !important;
+        color: #fbbf24 !important;
+        background: rgba(251, 191, 36, 0.08) !important;
     }
-    
-    /* Tabs */
+
+    /* ========== TABS ========== */
     .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
+        gap: 6px;
         background: transparent;
+        border-bottom: 1px solid rgba(51, 65, 85, 0.35);
+        padding-bottom: 4px;
     }
-    
     .stTabs [data-baseweb="tab"] {
-        background: rgba(30, 41, 59, 0.5);
+        background: transparent;
         border-radius: 8px;
         color: #94a3b8;
         padding: 8px 16px;
+        font-weight: 500;
     }
-    
     .stTabs [aria-selected="true"] {
-        background: rgba(51, 65, 85, 0.9) !important;
+        background: #1E293B !important;
         color: #f8fafc !important;
     }
-    
-    /* Sidebar */
+
+    /* ========== SIDEBAR ========== */
     section[data-testid="stSidebar"] {
-        background-color: #0f172a;
-        border-right: 1px solid rgba(51, 65, 85, 0.5);
+        background-color: #0F172A !important;
+        border-right: 1px solid rgba(51, 65, 85, 0.4);
     }
-    
-    /* Input fields */
+
+    /* ========== INPUTS ========== */
     .stTextInput > div > div > input,
     .stNumberInput > div > div > input,
-    .stSelectbox > div > div {
-        background-color: rgba(30, 41, 59, 0.7);
-        border: 1px solid rgba(51, 65, 85, 0.6);
-        border-radius: 8px;
-        color: #f8fafc;
+    .stSelectbox > div > div,
+    .stTextArea > div > div > textarea {
+        background-color: #1E293B !important;
+        border: 1px solid rgba(51, 65, 85, 0.55) !important;
+        border-radius: 8px !important;
+        color: #f8fafc !important;
     }
-    
-    /* Chat messages */
+
+    /* ========== CHAT ========== */
     .chat-user {
-        background: rgba(51, 65, 85, 0.6);
+        background: #334155;
         border-radius: 12px;
         padding: 10px 14px;
-        margin: 6px 0;
-        margin-left: 20%;
+        margin: 6px 0 6px 18%;
         text-align: right;
+        font-size: 0.9rem;
     }
-    
     .chat-assistant {
-        background: rgba(30, 41, 59, 0.7);
+        background: #1E293B;
         border: 1px solid rgba(51, 65, 85, 0.4);
         border-radius: 12px;
         padding: 10px 14px;
-        margin: 6px 0;
-        margin-right: 15%;
+        margin: 6px 12% 6px 0;
+        font-size: 0.9rem;
+        line-height: 1.45;
     }
-    
-    /* Level ladder */
+
+    /* ========== LEVEL LADDER ========== */
     .level-row {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        padding: 8px 12px;
-        border-radius: 8px;
-        margin-bottom: 4px;
+        padding: 9px 14px;
+        border-radius: 10px;
+        margin-bottom: 5px;
     }
-    
     .level-support {
-        background: rgba(16, 185, 129, 0.08);
-        border: 1px solid rgba(16, 185, 129, 0.15);
+        background: rgba(16, 185, 129, 0.07);
+        border: 1px solid rgba(16, 185, 129, 0.18);
     }
-    
     .level-resistance {
-        background: rgba(239, 68, 68, 0.08);
-        border: 1px solid rgba(239, 68, 68, 0.15);
+        background: rgba(239, 68, 68, 0.07);
+        border: 1px solid rgba(239, 68, 68, 0.18);
     }
-    
-    /* Heatmap tile */
+
+    /* ========== HEATMAP ========== */
     .heat-up {
-        background: rgba(34, 197, 94, 0.15);
-        border: 1px solid rgba(34, 197, 94, 0.3);
+        background: rgba(34, 197, 94, 0.12);
+        border: 1px solid rgba(34, 197, 94, 0.28);
     }
-    
     .heat-down {
-        background: rgba(239, 68, 68, 0.15);
-        border: 1px solid rgba(239, 68, 68, 0.3);
+        background: rgba(239, 68, 68, 0.12);
+        border: 1px solid rgba(239, 68, 68, 0.28);
     }
-    
-    /* Alert triggered */
+
+    /* ========== ALERTS ========== */
     .alert-triggered {
         background: rgba(251, 191, 36, 0.1);
-        border: 1px solid rgba(251, 191, 36, 0.3);
-        border-radius: 8px;
-        padding: 10px;
+        border: 1px solid rgba(251, 191, 36, 0.35);
+        border-radius: 10px;
+        padding: 11px 14px;
     }
-    
-    /* Scrollbar */
-    ::-webkit-scrollbar {
-        width: 6px;
-        height: 6px;
-    }
-    ::-webkit-scrollbar-track {
-        background: #0f172a;
-    }
-    ::-webkit-scrollbar-thumb {
-        background: #334155;
-        border-radius: 3px;
-    }
+
+    /* ========== SCROLLBAR ========== */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -800,13 +784,15 @@ with tab_dash:
             
             fig.update_layout(
                 template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(15,23,42,0.6)",
+                paper_bgcolor="#0F172A",
+                plot_bgcolor="#0F172A",
                 height=420,
-                margin=dict(l=10, r=10, t=30, b=10),
+                margin=dict(l=8, r=8, t=28, b=8),
                 xaxis_rangeslider_visible=False,
                 showlegend=False,
-                font=dict(color="#94a3b8"),
+                font=dict(color="#94a3b8", size=11),
+                xaxis=dict(gridcolor="rgba(51,65,85,0.35)", zeroline=False),
+                yaxis=dict(gridcolor="rgba(51,65,85,0.35)", zeroline=False, side="right"),
             )
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -1019,12 +1005,15 @@ with tab_hist:
         ))
         fig_h.update_layout(
             template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(15,23,42,0.6)",
+            paper_bgcolor="#0F172A",
+            plot_bgcolor="#0F172A",
             height=280,
-            margin=dict(l=10, r=10, t=20, b=10),
+            margin=dict(l=8, r=8, t=20, b=8),
             xaxis_rangeslider_visible=False,
             showlegend=False,
+            font=dict(color="#94a3b8", size=11),
+            xaxis=dict(gridcolor="rgba(51,65,85,0.35)"),
+            yaxis=dict(gridcolor="rgba(51,65,85,0.35)", side="right"),
         )
         st.plotly_chart(fig_h, use_container_width=True)
         
