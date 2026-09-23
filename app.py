@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 from groq import Groq
-from google import genai as google_genai
+import genai as google_genai
 
 st.set_page_config(page_title="AI Institutional Terminal", layout="wide")
 
