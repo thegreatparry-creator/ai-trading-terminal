@@ -6,17 +6,18 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
-import google.generativeai as genai
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
 from groq import Groq
+from google import genai as google_genai
 
 st.set_page_config(page_title="AI Institutional Terminal", layout="wide")
 
 
+# ================== SECRETS ==================
 def secret(name):
     try:
         return st.secrets.get(name, "")
@@ -24,18 +25,23 @@ def secret(name):
         return ""
 
 
-GROQ_KEY, GEMINI_KEY = secret("GROQ_KEY"), secret("GEMINI_KEY")
-TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID = secret("TELEGRAM_BOT_TOKEN"), secret("TELEGRAM_CHAT_ID")
+GROQ_KEY = secret("GROQ_KEY")
+GEMINI_KEY = secret("GEMINI_KEY")
+TELEGRAM_BOT_TOKEN = secret("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = secret("TELEGRAM_CHAT_ID")
+
 groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
+# google-generativeai (old SDK) is deprecated; using the current google-genai SDK.
+gemini_client = google_genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
 GROQ_MODELS = {
-    "Groq GPT-OSS 20B": "openai/gpt-oss-20b",
-    "Groq GPT-OSS 120B": "openai/gpt-oss-120b",
+    "Groq GPT-OSS 20B (fast)": "openai/gpt-oss-20b",
+    "Groq GPT-OSS 120B (smartest)": "openai/gpt-oss-120b",
     "Groq Qwen3 32B": "qwen/qwen3-32b",
+    "Groq Kimi K2": "moonshotai/kimi-k2-instruct",
 }
-GEMINI_MODELS = {"Gemini Flash": "gemini-3.5-flash", "Gemini Pro": "gemini-3.1-pro-preview"}
+GEMINI_MODELS = {"Gemini 3.5 Flash": "gemini-3.5-flash", "Gemini 3.1 Pro (Preview)": "gemini-3.1-pro-preview"}
+
 NEWS_SOURCES = [
     ("Moneycontrol", "https://www.moneycontrol.com/rss/latestnews.xml"),
     ("Economic Times", "https://economictimes.indiatimes.com/markets/rssfeeds/1998028306.cms"),
@@ -48,48 +54,151 @@ NEWS_SOURCES = [
     ("ForexLive", "https://www.forexlive.com/servicexml/xml.aspx?xml=1"),
 ]
 
+SECTOR_INDICES = {
+    "India - NSE": {"Nifty Bank": "^NSEBANK", "Nifty IT": "^CNXIT", "Nifty Auto": "^CNXAUTO", "Nifty FMCG": "^CNXFMCG", "Nifty Pharma": "^CNXPHARMA", "Nifty Metal": "^CNXMETAL"},
+    "United States": {"Tech (XLK)": "XLK", "Financials (XLF)": "XLF", "Healthcare (XLV)": "XLV", "Consumer (XLP)": "XLP", "Energy (XLE)": "XLE"},
+    "Global Indices": {"S&P 500": "^GSPC", "Nasdaq": "^IXIC", "Dow Jones": "^DJI", "DAX": "^GDAXI", "FTSE": "^FTSE", "Nikkei": "^N225"},
+    "Commodities": {"Gold": "GC=F", "Silver": "SI=F", "Oil": "CL=F", "Natural Gas": "NG=F", "Copper": "HG=F"},
+    "Cryptocurrency": {"BTC": "BTC-USD", "ETH": "ETH-USD", "BNB": "BNB-USD", "SOL": "SOL-USD", "XRP": "XRP-USD"},
+}
+SECTOR_STOCKS = {
+    "India - NSE": {
+        "Banking": ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS", "AXISBANK.NS"],
+        "IT": ["TCS.NS", "INFY.NS", "HCLTECH.NS", "WIPRO.NS", "TECHM.NS"],
+        "Auto": ["MARUTI.NS", "TATAMOTORS.NS", "M&M.NS", "BAJAJ-AUTO.NS"],
+        "FMCG": ["ITC.NS", "HINDUNILVR.NS", "NESTLEIND.NS", "BRITANNIA.NS"],
+        "Pharma": ["SUNPHARMA.NS", "DRREDDY.NS", "DIVISLAB.NS", "CIPLA.NS"],
+        "Energy": ["RELIANCE.NS", "ONGC.NS", "BPCL.NS", "IOC.NS"],
+        "Metal": ["TATASTEEL.NS", "HINDALCO.NS", "JSWSTEEL.NS", "ADANIENT.NS"],
+    },
+    "United States": {
+        "Tech Giants": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMZN"],
+        "Banking": ["JPM", "BAC", "WFC", "GS", "MS"],
+        "Healthcare": ["JNJ", "UNH", "PFE", "MRK", "ABBV"],
+        "Consumer": ["WMT", "PG", "KO", "PEP", "COST"],
+        "Auto": ["TSLA", "F", "GM", "RIVN"],
+    },
+    "Cryptocurrency": {
+        "Top 10": ["BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "AVAX-USD", "DOGE-USD", "TRX-USD", "DOT-USD"],
+        "DeFi": ["UNI-USD", "LINK-USD", "AAVE-USD", "MKR-USD", "COMP-USD"],
+        "Layer 2": ["MATIC-USD", "ARB-USD", "OP-USD", "LRC-USD"],
+    },
+    "Commodities": {
+        "Metals": ["GC=F", "SI=F", "PL=F", "PA=F"],
+        "Energy": ["CL=F", "NG=F", "HO=F", "RB=F"],
+        "Agriculture": ["ZC=F", "ZW=F", "ZS=F", "KC=F"],
+    },
+    "Global Indices": {"Major": ["^GSPC", "^IXIC", "^DJI", "^GDAXI", "^FTSE", "^N225"]},
+}
+
+# Curated aliases for tickers whose Yahoo symbol never appears in a headline (indices,
+# commodities, forex, crypto) — the main reason "news wasn't changing per stock".
+SYMBOL_ALIASES = {
+    "^NSEI": ["nifty", "nifty 50", "nifty50"], "^NSEBANK": ["bank nifty", "nifty bank"], "^BSESN": ["sensex"],
+    "^GSPC": ["s&p 500", "s&p500", "sp500"], "^DJI": ["dow jones", "dow"], "^IXIC": ["nasdaq"],
+    "^N225": ["nikkei"], "^FTSE": ["ftse"], "^GDAXI": ["dax"], "GC=F": ["gold"], "SI=F": ["silver"],
+    "CL=F": ["crude oil", "oil prices", "wti"], "NG=F": ["natural gas"], "BTC-USD": ["bitcoin", "btc"],
+    "ETH-USD": ["ethereum", "eth"], "EURUSD=X": ["euro", "eur/usd"], "GBPUSD=X": ["pound", "sterling", "gbp/usd"],
+    "USDJPY=X": ["yen", "usd/jpy"], "USDINR=X": ["rupee", "usd/inr"],
+}
+
 st.markdown("""
 <style>
-html,body,[class*="css"]{font-size:16px}.stButton>button{border-radius:8px;padding:.5rem 1rem}
+html,body,[class*="css"]{font-size:16px}
+h1{font-size:1.6rem!important}h2{font-size:1.25rem!important}h3{font-size:1.1rem!important}
+div[data-testid="stMetricValue"]{font-size:1.25rem!important}
+.stButton>button{border-radius:8px;padding:.5rem 1rem;font-size:1rem}
 .news-card{border:1px solid rgba(150,150,150,.28);border-radius:14px;padding:15px 16px;margin:0 0 13px;background:rgba(255,255,255,.025)}
 .news-card.direct{border-left:5px solid #26a269}.news-card.indirect{border-left:5px solid #e8a317}
-.news-head{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.news-title{font-size:1.05rem;font-weight:700;line-height:1.4;margin:7px 0}.news-summary,.news-reason{line-height:1.55;opacity:.88}.news-meta{font-size:.78rem;opacity:.68;margin-top:9px}.badge{padding:5px 10px;border-radius:99px;font-size:.75rem;font-weight:700}.green{background:#164d35;color:#6ee7a0}.yellow{background:#604811;color:#ffd166}.red{background:#5b2020;color:#ff8b8b}
-.zone{border:1px solid rgba(140,140,140,.3);border-radius:15px;padding:15px;margin:10px 0}.zone-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.stat{padding:9px;border-radius:9px;background:rgba(0,0,0,.08)}.small{font-size:.75rem;opacity:.7}.value{font-weight:700;margin-top:3px}
+.news-head{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+.news-title{font-size:1.05rem;font-weight:700;line-height:1.4;margin:7px 0}
+.news-summary,.news-reason{line-height:1.55;opacity:.88}
+.news-meta{font-size:.78rem;opacity:.68;margin-top:9px}
+.badge{padding:5px 10px;border-radius:99px;font-size:.75rem;font-weight:700;white-space:nowrap}
+.green{background:#164d35;color:#6ee7a0}.yellow{background:#604811;color:#ffd166}.red{background:#5b2020;color:#ff8b8b}
+.zone{border:1px solid rgba(140,140,140,.3);border-left:5px solid #999;border-radius:15px;padding:15px;margin:10px 0}
+.zone.bullish{border-left-color:#26a269}.zone.bearish{border-left-color:#e05252}.zone.neutral{border-left-color:#e8a317}
+.zone-title{font-weight:700;font-size:.95rem;margin-bottom:8px}
+.zone-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
+.stat{padding:9px;border-radius:9px;background:rgba(0,0,0,.08)}
+.small{font-size:.75rem;opacity:.7}.value{font-weight:700;margin-top:3px}
+.ladder-row{display:flex;justify-content:space-between;padding:7px 12px;border-radius:7px;margin-bottom:4px;font-size:.92rem}
+.ladder-row.resistance{background:rgba(224,82,82,.08)}.ladder-row.support{background:rgba(38,162,105,.08)}
+.ladder-row.anchor{background:rgba(59,130,246,.14);font-weight:700}
+.ladder-row.current{outline:2px solid #f4c542;background:rgba(244,197,66,.2);font-weight:700}
 @media(max-width:640px){h1{font-size:1.4rem!important}.zone-grid{grid-template-columns:1fr}.news-title{font-size:1rem}}
 </style>
 """, unsafe_allow_html=True)
 st.title("🎯 AI Trading Terminal - PRO")
 
 
+# ================== SMALL UTILITIES ==================
 def clean(value):
     return re.sub(r"\s+", " ", html_module.unescape(re.sub(r"<[^>]+>", " ", value or ""))).strip()
 
 
+def send_telegram_alert(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return False
+
+
 def yahoo_search(query, limit=8):
     try:
-        r = requests.get("https://query2.finance.yahoo.com/v1/finance/search", params={"q": query, "quotesCount": limit, "newsCount": 0}, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+        r = requests.get("https://query2.finance.yahoo.com/v1/finance/search",
+                          params={"q": query, "quotesCount": limit, "newsCount": 0},
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
         r.raise_for_status()
         return [x for x in r.json().get("quotes", []) if x.get("symbol")]
     except Exception:
         return []
 
 
+@st.cache_data(ttl=30)
+def fast_quote(ticker):
+    """Real-time-ish last price + % change via yfinance's lightweight fast_info."""
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        last = float(fi.get("last_price") or 0)
+        prev = float(fi.get("previous_close") or last)
+        change = ((last - prev) / prev * 100) if prev else 0.0
+        return last, change
+    except Exception:
+        return None, None
+
+
+# ================== SIDEBAR: UNIVERSAL SYMBOL SEARCH ==================
 st.sidebar.header("🔍 Search Any Stock / Index / Crypto")
 query = st.sidebar.text_input("Company name or ticker", "RELIANCE", key="global_search_query").strip().upper()
 searches = yahoo_search(query) if query else []
 if searches:
-    labels = [f"{x['symbol']} — {x.get('shortname') or x.get('longname') or x['symbol']} ({x.get('exchange','')} · {x.get('quoteType','')})" for x in searches]
+    labels = [f"{x['symbol']} — {x.get('shortname') or x.get('longname') or x['symbol']} ({x.get('exchange', '')} · {x.get('quoteType', '')})" for x in searches]
     picked = st.sidebar.radio("Matching symbols", labels, key="global_search_pick")
     symbol = searches[labels.index(picked)]["symbol"]
 else:
-    market = st.sidebar.selectbox("Market", ["India - NSE (.NS)", "United States", "Crypto", "Forex", "Commodities"])
+    st.sidebar.caption("No matches found — using the manual selector below.")
+    manual_market = st.sidebar.selectbox("Market", ["India - NSE (.NS)", "United States", "Crypto", "Forex", "Commodities"])
     raw = st.sidebar.text_input("Exact ticker", query).strip().upper()
-    suffix = {"India - NSE (.NS)": ".NS", "Crypto": "-USD", "Forex": "=X", "Commodities": "=F"}.get(market, "")
+    suffix = {"India - NSE (.NS)": ".NS", "Crypto": "-USD", "Forex": "=X", "Commodities": "=F"}.get(manual_market, "")
     symbol = raw if not suffix or raw.endswith(suffix) else raw + suffix
 
-sentiment_filter = st.sidebar.multiselect("Sentiment filter", ["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"], default=["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"])
+sentiment_filter = st.sidebar.multiselect("Sentiment filter", ["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"],
+                                            default=["🟢 Bullish", "🔴 Bearish", "🟡 Neutral"])
+
+st.sidebar.markdown("---")
+st.sidebar.header("📱 Telegram Alerts")
+if st.sidebar.button("🧪 Test Telegram Alert"):
+    ok = send_telegram_alert(f"🧪 <b>TEST ALERT</b>\n✅ Telegram working!\n🕐 {datetime.now().strftime('%H:%M:%S')}")
+    st.sidebar.success("✅ Test sent!") if ok else st.sidebar.error("❌ Failed — check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in secrets.")
 
 
+# ================== STOCK DATA ==================
 @st.cache_data(ttl=120)
 def get_stock(ticker):
     try:
@@ -99,6 +208,179 @@ def get_stock(ticker):
         return pd.DataFrame(), {}
 
 
+@st.cache_data(ttl=60)
+def get_intraday(ticker):
+    """Last ~2 trading sessions of 15-min candles + that day's opening price (the 0° Gann anchor)."""
+    try:
+        data = yf.Ticker(ticker).history(period="5d", interval="15m")
+        if data.empty:
+            return pd.DataFrame(), None
+        today = datetime.now().date()
+        data = data[data.index.date >= today - timedelta(days=2)]
+        return data, (float(data["Open"].iloc[0]) if len(data) else None)
+    except Exception:
+        return pd.DataFrame(), None
+
+
+@st.cache_data(ttl=120)
+def get_two_day_intraday(ticker):
+    """Per-day summary + Gann ladder for the last 2 available trading sessions (auto-skips
+    weekends/holidays since yfinance only returns actual trading candles)."""
+    try:
+        data = yf.Ticker(ticker).history(period="5d", interval="15m")
+        if data.empty:
+            return []
+        data = data.copy()
+        data["Date"] = data.index.date
+        out = []
+        for d in sorted(data["Date"].unique(), reverse=True)[:2]:
+            day_df = data[data["Date"] == d]
+            if len(day_df) < 3:
+                continue
+            o = float(day_df["Open"].iloc[0])
+            out.append({
+                "date": d, "open": o, "high": float(day_df["High"].max()),
+                "low": float(day_df["Low"].min()), "close": float(day_df["Close"].iloc[-1]),
+                "ladder": gann_ladder_levels(o),
+            })
+        return out
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def get_swing_data(ticker):
+    try:
+        return yf.Ticker(ticker).history(period="6mo", interval="1d")
+    except Exception:
+        return pd.DataFrame()
+
+
+# ================== GANN LADDER / SMART MONEY ZONES ==================
+def gann_ladder_levels(open_price):
+    """Sorted ladder of every Gann-angle level (R + S) plus the 0° opening-price anchor."""
+    sqrt_p = math.sqrt(abs(open_price))
+    ladder = [{"label": "0° (Open)", "side": "OPEN", "value": float(open_price)}]
+    for deg, delta in [(22.5, 22.5 / 180), (45, 45 / 180), (67.5, 67.5 / 180), (90, 90 / 180), (180, 180 / 180)]:
+        ladder.append({"label": f"{deg}° R", "side": "R", "value": (sqrt_p + delta) ** 2})
+        ladder.append({"label": f"{deg}° S", "side": "S", "value": (sqrt_p - delta) ** 2})
+    ladder.sort(key=lambda x: x["value"])
+    return ladder
+
+
+def locate_band(ladder, price):
+    if price <= ladder[0]["value"]:
+        return "below"
+    if price >= ladder[-1]["value"]:
+        return "above"
+    for i in range(len(ladder) - 1):
+        if ladder[i]["value"] <= price <= ladder[i + 1]["value"]:
+            return ladder[i], ladder[i + 1]
+    return "below"
+
+
+def zoom_window(ladder, band, price, context=1):
+    if isinstance(band, tuple):
+        lo_idx, hi_idx = ladder.index(band[0]), ladder.index(band[1])
+    else:
+        lo_idx, hi_idx = 0, len(ladder) - 1
+    start, end = max(0, lo_idx - context), min(len(ladder) - 1, hi_idx + context)
+    window = ladder[start:end + 1]
+    vals = [lvl["value"] for lvl in window] + [price]
+    y_min, y_max = min(vals), max(vals)
+    pad = (y_max - y_min) * 0.18 if y_max > y_min else max(abs(price) * 0.01, 0.0001)
+    return y_min - pad, y_max + pad, window
+
+
+def detect_order_block(price_df, lookback=60, impulse_atr_mult=1.8, search_back=6):
+    """Simplified SMC order-block heuristic — a zone to watch, not a signal on its own."""
+    if price_df is None or len(price_df) < 15:
+        return None
+    d = price_df.tail(lookback).copy()
+    d["body"] = (d["Close"] - d["Open"]).abs()
+    d["range"] = d["High"] - d["Low"]
+    atr = d["range"].rolling(14, min_periods=5).mean()
+    bullish_ob, bearish_ob = None, None
+    for i in range(len(d) - 2, 0, -1):
+        a = atr.iloc[i]
+        if pd.isna(a) or a == 0 or d["body"].iloc[i] <= impulse_atr_mult * a:
+            continue
+        up, down = d["Close"].iloc[i] > d["Open"].iloc[i], d["Close"].iloc[i] < d["Open"].iloc[i]
+        if up and bullish_ob is None:
+            for j in range(i - 1, max(i - search_back, -1), -1):
+                if d["Close"].iloc[j] < d["Open"].iloc[j]:
+                    bullish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j])}
+                    break
+        if down and bearish_ob is None:
+            for j in range(i - 1, max(i - search_back, -1), -1):
+                if d["Close"].iloc[j] > d["Open"].iloc[j]:
+                    bearish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j])}
+                    break
+        if bullish_ob and bearish_ob:
+            break
+    return {"bullish": bullish_ob, "bearish": bearish_ob} if (bullish_ob or bearish_ob) else None
+
+
+def detect_golden_pocket(price_df, lookback=80):
+    if price_df is None or len(price_df) < 15:
+        return None
+    d = price_df.tail(lookback)
+    swing_high, swing_low = float(d["High"].max()), float(d["Low"].min())
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return None
+    uptrend = d["Low"].idxmin() < d["High"].idxmax()
+    if uptrend:
+        gp_low, gp_high = swing_high - diff * 0.65, swing_high - diff * 0.618
+    else:
+        gp_low, gp_high = swing_low + diff * 0.618, swing_low + diff * 0.65
+    return {"gp_low": gp_low, "gp_high": gp_high, "uptrend": uptrend}
+
+
+def swing_levels(daily_df, window=4, lookback=130, max_levels=4, tol_pct=0.008):
+    """Long-term swing support/resistance from local pivot highs/lows over ~6 months."""
+    d = daily_df.tail(lookback)
+    if len(d) < window * 2 + 5:
+        return [], []
+    h_vals, l_vals = d["High"].values, d["Low"].values
+    highs, lows = [], []
+    for i in range(window, len(d) - window):
+        seg_h, seg_l = h_vals[i - window:i + window + 1], l_vals[i - window:i + window + 1]
+        if h_vals[i] == seg_h.max():
+            highs.append(float(h_vals[i]))
+        if l_vals[i] == seg_l.min():
+            lows.append(float(l_vals[i]))
+
+    def dedupe(values):
+        out = []
+        for v in sorted(set(round(v, 2) for v in values), reverse=True):
+            if not out or all(abs(v - o) / v > tol_pct for o in out):
+                out.append(v)
+            if len(out) >= max_levels:
+                break
+        return out
+
+    return dedupe(highs), dedupe(lows)
+
+
+def render_zone_card(css_class, title, price, zone_low, zone_high, note):
+    st.markdown(f"""<div class="zone {css_class}"><div class="zone-title">{title}</div>
+<div class="zone-grid">
+  <div class="stat"><div class="small">Current</div><div class="value">{price:.2f}</div></div>
+  <div class="stat"><div class="small">Zone Low</div><div class="value">{zone_low:.2f}</div></div>
+  <div class="stat"><div class="small">Zone High</div><div class="value">{zone_high:.2f}</div></div>
+</div><p>{note}</p></div>""", unsafe_allow_html=True)
+
+
+def render_ladder(ladder, band):
+    for lvl in reversed(ladder):
+        css = "anchor" if lvl["side"] == "OPEN" else ("resistance" if lvl["side"] == "R" else "support")
+        if isinstance(band, tuple) and lvl in band:
+            css = "current"
+        st.markdown(f'<div class="ladder-row {css}"><span>{lvl["label"]}</span><span>{lvl["value"]:.2f}</span></div>', unsafe_allow_html=True)
+
+
+# ================== NEWS PIPELINE ==================
 @st.cache_data(ttl=180, show_spinner=False)
 def get_news():
     unique = {}
@@ -118,21 +400,27 @@ def get_news():
                 except Exception:
                     dt = datetime.now(timezone.utc) - timedelta(days=7)
                 key = link or re.sub(r"[^a-z0-9]", "", title.lower())
-                unique.setdefault(key, {"title": title, "summary": clean(item.findtext("description", "")) or title, "link": link, "source": source, "published": published, "dt": dt})
+                unique.setdefault(key, {"title": title, "summary": clean(item.findtext("description", "")) or title,
+                                         "link": link, "source": source, "published": published, "dt": dt})
         except Exception as exc:
             print(f"News source error ({source}): {exc}")
     return list(unique.values())
 
 
 def keywords(ticker, info):
-    raw = re.sub(r"(\.NS|-USD|=X|=F)$", "", ticker.lower())
+    raw = re.sub(r"(\.NS|-USD|=X|=F)$", "", ticker.lower()).lstrip("^")
     name = (info.get("longName") or info.get("shortName") or "").lower()
-    return [x for x in {raw, name, *re.findall(r"[a-z0-9]+", name)} if len(x) >= 3]
+    kw = {raw, name, *re.findall(r"[a-z0-9]+", name)}
+    kw.update(a.lower() for a in SYMBOL_ALIASES.get(ticker, []))
+    return [x for x in kw if len(x) >= 3]
 
 
 def sector_words(ticker, info):
-    text = f"{ticker} {info.get('longName','')} {info.get('sector','')} {info.get('industry','')}".lower()
-    groups = ["technology", "software", "cloud", "semiconductor", "chip", "bank", "finance", "interest rate", "credit", "oil", "gas", "energy", "crude", "auto", "vehicle", "ev", "pharma", "drug", "healthcare", "fda", "consumer", "retail", "fmcg", "metal", "steel", "copper", "mining", "crypto", "bitcoin", "blockchain", "inflation", "tariff", "currency", "regulation"]
+    text = f"{ticker} {info.get('longName', '')} {info.get('sector', '')} {info.get('industry', '')}".lower()
+    groups = ["technology", "software", "cloud", "semiconductor", "chip", "bank", "finance", "interest rate", "credit",
+              "oil", "gas", "energy", "crude", "auto", "vehicle", "ev", "pharma", "drug", "healthcare", "fda",
+              "consumer", "retail", "fmcg", "metal", "steel", "copper", "mining", "crypto", "bitcoin", "blockchain",
+              "inflation", "tariff", "currency", "regulation"]
     return [w for w in groups if w in text]
 
 
@@ -141,7 +429,9 @@ def rank_article(article, direct_keys, indirect_keys):
     d_hits, i_hits = sum(k in text for k in direct_keys), sum(k in text for k in indirect_keys)
     if not d_hits and not i_hits:
         return None
-    catalysts = ["earnings", "revenue", "profit", "guidance", "regulator", "lawsuit", "acquisition", "merger", "tariff", "rate", "inflation", "sanction", "upgrade", "downgrade", "contract", "warning", "forecast", "results"]
+    catalysts = ["earnings", "revenue", "profit", "guidance", "regulator", "lawsuit", "acquisition", "merger",
+                 "tariff", "rate", "inflation", "sanction", "upgrade", "downgrade", "contract", "warning",
+                 "forecast", "results"]
     age = max(0, (datetime.now(timezone.utc) - article["dt"]).total_seconds() / 3600)
     freshness = max(0, 10 - min(age / 3, 10))
     source_weight = {"CNBC": 1.7, "Economic Times": 1.5, "Moneycontrol": 1.4, "Yahoo Finance": 1.4, "MarketWatch": 1.3}.get(article["source"], 1)
@@ -168,7 +458,7 @@ def explain_indirect(items, ticker, info):
     if not groq_client or not items:
         return {}
     body = "\n".join(f"{i}|{x['title']} — {x['summary']}" for i, x in enumerate(items))
-    prompt = f"Explain the indirect connection of each news item to {ticker} ({info.get('longName','')}). Return one concise line as INDEX|EXPLANATION. Do not invent facts.\n{body}"
+    prompt = f"Explain the indirect connection of each news item to {ticker} ({info.get('longName', '')}). Return one concise line as INDEX|EXPLANATION. Do not invent facts.\n{body}"
     try:
         answer = groq_client.chat.completions.create(model="openai/gpt-oss-20b", messages=[{"role": "user", "content": prompt}], temperature=.1, max_tokens=900).choices[0].message.content
         return {int(m.group(1)): m.group(2).strip() for line in answer.splitlines() if (m := re.match(r"\s*(\d+)\s*[|:-]\s*(.+)", line))}
@@ -182,124 +472,425 @@ def render_news(article):
     st.markdown(f"<div class='news-card {kind}'><div class='news-head'><span class='badge {x['tone']}'>{'DIRECT' if article['direct'] else 'INDIRECT'} · {x['label']}</span><b>Importance {article['importance']:.0f}/100 · Impact {x['score']:.1f}/10</b></div><div class='news-title'>{html_module.escape(article['title'])}</div><div class='news-summary'>{html_module.escape(article['summary'])}</div><div class='news-reason'>🧠 <b>Why it matters:</b> {html_module.escape(x['reason'])}</div><div class='news-meta'>📌 {html_module.escape(article['source'])} · 🕒 {html_module.escape(article['published'])} · <a href='{html_module.escape(article['link'])}' target='_blank'>Read source →</a></div></div>", unsafe_allow_html=True)
 
 
+# ================== LEVELS / TRADE SUGGESTION / BACKTEST ==================
 def levels(data):
     high, low, close = map(float, [data.High.iloc[-1], data.Low.iloc[-1], data.Close.iloc[-1]])
     p = (high + low + close) / 3
-    return {"price": close, "pivot": round(p, 2), "r1": round(2*p-low, 2), "r2": round(p+high-low, 2), "r3": round(high+2*(p-low), 2), "r4": round(high+3*(p-low), 2), "s1": round(2*p-high, 2), "s2": round(p-high+low, 2), "s3": round(low-2*(high-p), 2), "s4": round(low-3*(high-p), 2)}
+    return {"price": close, "pivot": round(p, 2), "r1": round(2 * p - low, 2), "r2": round(p + high - low, 2),
+            "r3": round(high + 2 * (p - low), 2), "r4": round(high + 3 * (p - low), 2), "s1": round(2 * p - high, 2),
+            "s2": round(p - high + low, 2), "s3": round(low - 2 * (high - p), 2), "s4": round(low - 3 * (high - p), 2)}
+
+
+def get_trade_suggestion(ticker, price, q, ladder, band, articles):
+    if not groq_client:
+        return "⚠️ Configure GROQ_KEY in .streamlit/secrets.toml to enable AI suggestions."
+    band_text = (f"between {band[0]['label']} ({band[0]['value']:.2f}) and {band[1]['label']} ({band[1]['value']:.2f})"
+                 if isinstance(band, tuple) else f"{band} every calculated level")
+    news_text = "\n".join(f"- {a['title']} (impact {a['impact']['label']} {a['impact']['score']}/10)" for a in articles[:5]) or "No relevant news."
+    prompt = (f"You are a trading analyst. Ticker: {ticker}. Current price: {price:.2f}.\n"
+              f"Pivot={q['pivot']}, R1={q['r1']}, S1={q['s1']}.\n"
+              f"Price is currently {band_text} on the Gann angle ladder.\n"
+              f"Recent relevant news:\n{news_text}\n\n"
+              f"Give a concise INTRADAY plan (entry, stop-loss, target) and a SWING plan (entry, stop-loss, target). "
+              f"Be specific with numeric levels. This is educational, not financial advice.")
+    try:
+        res = groq_client.chat.completions.create(model="openai/gpt-oss-20b", messages=[{"role": "user", "content": prompt}], temperature=0.2, max_tokens=700)
+        return res.choices[0].message.content
+    except Exception as e:
+        return f"⚠️ AI Error: {type(e).__name__}: {e}"
 
 
 def backtest(ticker, start, end, strategy):
     try:
-        data = yf.Ticker(ticker).history(start=start, end=end, interval="1d"); trades = []
+        data = yf.Ticker(ticker).history(start=start, end=end, interval="1d")
+        trades = []
         for i in range(1, len(data)):
-            p = (data.High.iloc[i-1]+data.Low.iloc[i-1]+data.Close.iloc[i-1])/3; s1, r1 = 2*p-data.High.iloc[i-1], 2*p-data.Low.iloc[i-1]
-            if strategy == "Buy at S1" and data.Low.iloc[i] <= s1: trades.append((s1, p))
-            if strategy == "Sell at R1" and data.High.iloc[i] >= r1: trades.append((r1, p))
-        profits = [x-e for e,x in trades]
-        return {"Trades": len(profits), "Win %": round(sum(x > 0 for x in profits)/len(profits)*100, 1) if profits else 0, "Average profit": round(sum(profits)/len(profits), 2) if profits else 0, "Total profit": round(sum(profits), 2)}
+            p = (data.High.iloc[i - 1] + data.Low.iloc[i - 1] + data.Close.iloc[i - 1]) / 3
+            s1, r1 = 2 * p - data.High.iloc[i - 1], 2 * p - data.Low.iloc[i - 1]
+            if strategy == "Buy at S1" and data.Low.iloc[i] <= s1:
+                trades.append((s1, p))
+            if strategy == "Sell at R1" and data.High.iloc[i] >= r1:
+                trades.append((r1, p))
+        profits = [x - e for e, x in trades]
+        return {"Trades": len(profits), "Win %": round(sum(x > 0 for x in profits) / len(profits) * 100, 1) if profits else 0,
+                "Average profit": round(sum(profits) / len(profits), 2) if profits else 0, "Total profit": round(sum(profits), 2)}
     except Exception:
         return None
 
 
+# ================== LOAD DATA FOR SELECTED SYMBOL ==================
 df, info = get_stock(symbol)
 if df.empty:
-    st.error(f"No market data found for {symbol}.")
+    st.error(f"No market data found for {symbol}. Try the search box in the sidebar with a different spelling.")
     st.stop()
-price = float(df.Close.iloc[-1])
+
+live_price, _live_change = fast_quote(symbol)
+price = live_price if live_price is not None else float(df.Close.iloc[-1])
+
 articles = []
 for raw in get_news():
     item = rank_article(raw, keywords(symbol, info), sector_words(symbol, info))
     if item:
-        item["impact"] = impact(item, symbol, info); articles.append(item)
+        item["impact"] = impact(item, symbol, info)
+        articles.append(item)
 articles.sort(key=lambda x: (x["importance"], x["dt"]), reverse=True)
 indirect = [x for x in articles if not x["direct"]][:10]
 for idx, text in explain_indirect(indirect, symbol, info).items():
-    if 0 <= idx < len(indirect): indirect[idx]["impact"]["reason"] = text
+    if 0 <= idx < len(indirect):
+        indirect[idx]["impact"]["reason"] = text
+
+intraday_df, open_ref = get_intraday(symbol)
+chart_df = intraday_df if not intraday_df.empty else df
+gann_anchor = open_ref if open_ref else price
+ladder = gann_ladder_levels(gann_anchor)
+band = locate_band(ladder, price)
 
 # ================== TABS ==================
-tab_live, tab_news, tab_chat, tab_heat, tab_watch, tab_alerts, tab_history = st.tabs(["📊 Live Analysis", "📰 Ranked Stock News", "💬 AI Chat", "📊 Market Heatmap", "📋 Watchlist & Portfolio", "🔔 Alerts & Backtest", "📅 Historical Data"])
+tab_live, tab_news, tab_chat, tab_heat, tab_watch, tab_alerts, tab_history = st.tabs(
+    ["📊 Live Analysis", "📰 Ranked Stock News", "💬 AI Chat", "📊 Market Heatmap",
+     "📋 Watchlist & Portfolio", "🔔 Alerts & Backtest", "📅 Historical Data"])
 
+# ---------------- TAB: LIVE ANALYSIS ----------------
 with tab_live:
     st.header(f"📊 Live Analysis: {symbol}")
-    a, b, c = st.columns(3); a.metric("Current Price", f"{price:.2f}"); b.metric("Company", info.get("longName", symbol)); c.metric("Related stories", len(articles))
-    fig = go.Figure(go.Candlestick(x=df.index, open=df.Open, high=df.High, low=df.Low, close=df.Close, name=symbol)); fig.update_layout(height=460, xaxis_rangeslider_visible=False); st.plotly_chart(fig, use_container_width=True)
-    st.subheader("🧠 Smart Money Zones")
-    recent = df.tail(60)
-    if len(recent) >= 15:
-        hi, lo = float(recent.High.max()), float(recent.Low.min()); gp_low, gp_high = lo+(hi-lo)*.618, lo+(hi-lo)*.65
-        trend = "Bullish" if recent.Close.iloc[-1] >= recent.Close.iloc[0] else "Bearish"
-        st.markdown(f"<div class='zone'><b>🌀 Golden Pocket · {trend}</b><div class='zone-grid'><div class='stat'><div class='small'>Current</div><div class='value'>{price:.2f}</div></div><div class='stat'><div class='small'>Zone low</div><div class='value'>{gp_low:.2f}</div></div><div class='stat'><div class='small'>Zone high</div><div class='value'>{gp_high:.2f}</div></div></div><p>Recent swing retracement zone. {'Price is inside the zone.' if gp_low <= price <= gp_high else 'Price is outside the zone.'}</p></div>", unsafe_allow_html=True)
-    q = levels(df); st.subheader("🎯 Traditional Pivot Levels"); st.dataframe(pd.DataFrame([{"Level": k.upper(), "Value": q[k]} for k in ["r4","r3","r2","r1","pivot","s1","s2","s3","s4"]]), use_container_width=True)
+    col_main, col_ai = st.columns([2, 1], gap="large")
 
+    with col_main:
+        a, b, c = st.columns(3)
+        a.metric("Current Price", f"{price:.2f}")
+        b.metric("Company", info.get("longName", symbol))
+        c.metric("Related stories", len(articles))
+
+        st.subheader("🎯 Live Price Position")
+        st.caption("0° = today's opening 15-min candle. Every level below is calculated from that anchor, in real time.")
+        if band == "below":
+            st.warning(f"⬇️ Price **{price:.2f}** is BELOW every calculated level (lowest: {ladder[0]['label']} @ {ladder[0]['value']:.2f}) — possible breakdown zone.")
+        elif band == "above":
+            st.warning(f"⬆️ Price **{price:.2f}** is ABOVE every calculated level (highest: {ladder[-1]['label']} @ {ladder[-1]['value']:.2f}) — possible breakout zone.")
+        else:
+            lo, hi = band
+            st.success(f"💰 Price **{price:.2f}** is between **{lo['label']}** ({lo['value']:.2f}) and **{hi['label']}** ({hi['value']:.2f})")
+            span = hi["value"] - lo["value"]
+            pct = (price - lo["value"]) / span if span else 0
+            st.progress(min(max(pct, 0.0), 1.0), text=f"{pct * 100:.1f}% of the way from {lo['label']} to {hi['label']}")
+
+        if not chart_df.empty:
+            zoom = zoom_window(ladder, band, price, context=1)
+            fig = go.Figure(go.Candlestick(x=list(range(len(chart_df))), open=chart_df.Open, high=chart_df.High,
+                                            low=chart_df.Low, close=chart_df.Close, name=symbol))
+            if zoom:
+                y_min, y_max, visible = zoom
+                for lvl in visible:
+                    color = "#26a269" if lvl["side"] == "S" else ("#3b82f6" if lvl["side"] == "OPEN" else "#e05252")
+                    fig.add_hline(y=lvl["value"], line_dash="dash", line_width=1.6, line_color=color, opacity=0.9,
+                                  annotation_text=f"{lvl['label']}  {lvl['value']:.2f}", annotation_position="left",
+                                  annotation_font_size=12, annotation_bgcolor="rgba(255,255,255,0.75)")
+                if isinstance(band, tuple):
+                    fig.add_hrect(y0=band[0]["value"], y1=band[1]["value"], fillcolor="#f4c542", opacity=0.15, line_width=0)
+                fig.update_yaxes(range=[y_min, y_max])
+            # Categorical x-axis avoids ugly weekend/overnight gaps for any market worldwide
+            step = max(1, len(chart_df) // 6)
+            ticks = list(range(0, len(chart_df), step))
+            fig.update_xaxes(tickvals=ticks, ticktext=[chart_df.index[i].strftime("%d %b %H:%M") for i in ticks], tickangle=-30)
+            fig.update_layout(height=440, xaxis_rangeslider_visible=False, margin=dict(l=10, r=100, t=15, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("No intraday candle data available for this symbol right now.")
+
+        st.markdown("**📐 Full Gann Ladder**")
+        render_ladder(ladder, band)
+
+        st.subheader("🧠 Smart Money Zones")
+        ob = detect_order_block(chart_df)
+        if ob and ob.get("bullish"):
+            lo_ob, hi_ob = ob["bullish"]["low"], ob["bullish"]["high"]
+            inside = lo_ob <= price <= hi_ob
+            render_zone_card("bullish", "📦 Bullish Order Block (Demand)", price, lo_ob, hi_ob,
+                              "Price is currently inside this zone." if inside else "Price is currently outside this zone.")
+        if ob and ob.get("bearish"):
+            lo_ob, hi_ob = ob["bearish"]["low"], ob["bearish"]["high"]
+            inside = lo_ob <= price <= hi_ob
+            render_zone_card("bearish", "📦 Bearish Order Block (Supply)", price, lo_ob, hi_ob,
+                              "Price is currently inside this zone." if inside else "Price is currently outside this zone.")
+        if not ob:
+            st.caption("No clear recent order block detected in this window.")
+
+        gp = detect_golden_pocket(chart_df)
+        if gp:
+            inside = gp["gp_low"] <= price <= gp["gp_high"]
+            trend = "Bullish pullback" if gp["uptrend"] else "Bearish bounce"
+            render_zone_card("bullish" if gp["uptrend"] else "bearish", f"🌀 Golden Pocket (61.8%–65% Fib) · {trend}",
+                              price, gp["gp_low"], gp["gp_high"],
+                              "Price is inside the golden pocket." if inside else "Price is outside the golden pocket.")
+        else:
+            st.caption("Not enough recent data to compute a golden pocket.")
+
+        st.subheader("🎯 Traditional Pivot Levels")
+        q = levels(df)
+        st.dataframe(pd.DataFrame([{"Level": k.upper(), "Value": q[k]} for k in ["r4", "r3", "r2", "r1", "pivot", "s1", "s2", "s3", "s4"]]),
+                     use_container_width=True, hide_index=True)
+
+    with col_ai:
+        st.subheader("💡 AI Trade Suggestion")
+        st.caption("Intraday & swing read: entry, stop-loss, target.")
+        if st.button("🚀 Generate Suggestion", use_container_width=True):
+            with st.spinner("Analyzing..."):
+                st.session_state["last_suggestion"] = get_trade_suggestion(symbol, price, q, ladder, band, articles)
+        last = st.session_state.get("last_suggestion")
+        if last:
+            st.error(last) if last.startswith("⚠️") else st.markdown(last)
+        else:
+            st.caption("Tap the button to get an INTRADAY + SWING plan for this ticker.")
+
+# ---------------- TAB: RANKED STOCK NEWS ----------------
 with tab_news:
-    st.header(f"📰 Latest Relevant News — {symbol}"); st.caption("Fresh, deduplicated stories from all feeds, ranked by direct/indirect relevance, importance, and freshness.")
-    include_indirect = st.checkbox("Include indirect sector/macro news", True); limit = st.slider("Number of ranked stories", 5, 30, 12)
+    st.header(f"📰 Latest Relevant News — {symbol}")
+    st.caption("Fresh, deduplicated stories from all feeds, ranked by direct/indirect relevance, importance, and freshness.")
+    include_indirect = st.checkbox("Include indirect sector/macro news", True)
+    limit = st.slider("Number of ranked stories", 5, 30, 12)
     shown = [x for x in articles if include_indirect or x["direct"]]
-    shown = [x for x in shown if (x["impact"]["label"] == "Bullish" and "🟢 Bullish" in sentiment_filter) or (x["impact"]["label"] == "Bearish" and "🔴 Bearish" in sentiment_filter) or (x["impact"]["label"] == "Neutral" and "🟡 Neutral" in sentiment_filter)]
+    shown = [x for x in shown if (x["impact"]["label"] == "Bullish" and "🟢 Bullish" in sentiment_filter)
+             or (x["impact"]["label"] == "Bearish" and "🔴 Bearish" in sentiment_filter)
+             or (x["impact"]["label"] == "Neutral" and "🟡 Neutral" in sentiment_filter)]
     if shown:
-        for article in shown[:limit]: render_news(article)
-    else: st.warning("No relevant stories matched the current filters.")
+        for article in shown[:limit]:
+            render_news(article)
+    else:
+        st.warning("No relevant stories matched the current filters.")
 
+# ---------------- TAB: AI CHAT ----------------
 with tab_chat:
-    st.header("💬 AI Chat Assistant"); model_choice = st.selectbox("Choose Model", list(GROQ_MODELS) + list(GEMINI_MODELS)); prompt = st.chat_input("Ask about stock, levels, news, strategy...")
+    st.header("💬 AI Chat Assistant")
+    model_choice = st.selectbox("Choose Model", list(GROQ_MODELS) + list(GEMINI_MODELS))
+    st.session_state.setdefault("chat_messages", [])
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    prompt = st.chat_input("Ask about stock, levels, news, strategy...")
     if prompt:
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
         context = "\n".join(f"{x['title']} | {x['impact']['reason']}" for x in articles[:10])
-        try:
-            if model_choice in GROQ_MODELS and groq_client:
-                answer = groq_client.chat.completions.create(model=GROQ_MODELS[model_choice], messages=[{"role":"system","content":f"Trading assistant for {symbol}. Educational only. Context:\n{context}"},{"role":"user","content":prompt}], temperature=.2, max_tokens=900).choices[0].message.content
-            elif model_choice in GEMINI_MODELS and GEMINI_KEY:
-                answer = genai.GenerativeModel(GEMINI_MODELS[model_choice]).generate_content(f"Trading assistant for {symbol}. Context:{context}\nQuestion:{prompt}").text
-            else: answer = "⚠️ Configure the selected API key in .streamlit/secrets.toml."
-            st.markdown(answer)
-        except Exception as exc: st.error(f"AI error: {exc}")
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    if model_choice in GROQ_MODELS:
+                        answer = ("⚠️ Configure GROQ_KEY in .streamlit/secrets.toml." if not groq_client else
+                                  groq_client.chat.completions.create(
+                                      model=GROQ_MODELS[model_choice],
+                                      messages=[{"role": "system", "content": f"Trading assistant for {symbol}. Educational only. Context:\n{context}"},
+                                                {"role": "user", "content": prompt}],
+                                      temperature=.2, max_tokens=900).choices[0].message.content)
+                    elif model_choice in GEMINI_MODELS:
+                        if not gemini_client:
+                            answer = "⚠️ Configure GEMINI_KEY in .streamlit/secrets.toml."
+                        else:
+                            resp = gemini_client.models.generate_content(
+                                model=GEMINI_MODELS[model_choice],
+                                contents=f"Trading assistant for {symbol}. Context:{context}\nQuestion:{prompt}")
+                            answer = resp.text
+                    else:
+                        answer = "⚠️ Invalid model selected."
+                except Exception as exc:
+                    answer = f"⚠️ AI error: {type(exc).__name__}: {exc}"
+                st.error(answer) if answer.startswith("⚠️") else st.markdown(answer)
+        st.session_state.chat_messages.append({"role": "assistant", "content": answer})
 
+    if st.button("🗑️ Clear Chat"):
+        st.session_state.chat_messages = []
+        st.rerun()
+
+# ---------------- TAB: MARKET HEATMAP ----------------
 with tab_heat:
-    st.header("📊 Market Heatmap"); groups = {"Technology":["AAPL","MSFT","NVDA","GOOGL","META"],"Banking":["JPM","BAC","GS","MS"],"Energy":["XLE","CL=F","GC=F"],"Crypto":["BTC-USD","ETH-USD","SOL-USD"]}; group = st.selectbox("Select group", list(groups)); rows=[]
-    for ticker in groups[group]:
-        try:
-            fast = yf.Ticker(ticker).fast_info; last=float(fast.get("last_price",0)); prev=float(fast.get("previous_close",last)); change=(last-prev)/prev*100 if prev else 0; rows.append({"Asset":ticker,"Price":last,"Change %":round(change,2),"Intensity":f"{min(10,abs(change)/.3):.1f}/10"})
-        except Exception: pass
-    st.dataframe(pd.DataFrame(rows).sort_values("Change %", ascending=False) if rows else pd.DataFrame(), use_container_width=True)
+    st.header("📊 Market Heatmap")
+    heat_market = st.selectbox("Market", list(SECTOR_INDICES.keys()), key="heat_market")
+    sub_sector, sub_stock = st.tabs(["📊 Sector Performance", "🔥 Stock Heatmap"])
 
+    with sub_sector:
+        rows = []
+        for name, tkr in SECTOR_INDICES.get(heat_market, {}).items():
+            last, change = fast_quote(tkr)
+            if last is None:
+                continue
+            intensity = min(10, abs(change) / 0.5)
+            bar = ("🟢" if change > 0 else "🔴") * max(1, int(intensity)) if change else "⚪"
+            rows.append({"Sector": name, "Price": round(last, 2), "Change %": round(change, 2), "Bar": bar})
+        if rows:
+            for row in sorted(rows, key=lambda r: r["Change %"], reverse=True):
+                c1, c2, c3 = st.columns([2, 1, 2])
+                c1.markdown(f"### {row['Bar']} {row['Sector']}")
+                c2.metric("Price", f"{row['Price']:.2f}")
+                c3.metric("Change", f"{row['Change %']:.2f}%")
+                st.markdown("---")
+        else:
+            st.warning("Could not fetch sector data right now — try again in a moment.")
+
+    with sub_stock:
+        stock_groups = SECTOR_STOCKS.get(heat_market, {})
+        if not stock_groups:
+            st.info("No stock-level breakdown for this market yet.")
+        else:
+            chosen_sector = st.selectbox("Select sector", list(stock_groups.keys()), key="heat_sector")
+            rows = []
+            for tkr in stock_groups[chosen_sector]:
+                last, change = fast_quote(tkr)
+                if last is None:
+                    continue
+                name = tkr.replace(".NS", "").replace("-USD", "").replace("=F", "").replace("=X", "")
+                intensity = min(10, abs(change) / 0.3)
+                bar = ("🟢" if change > 0 else ("🔴" if change < 0 else "⚪")) * max(1, int(intensity))
+                rows.append({"Stock": name, "Price": round(last, 2), "Change %": round(change, 2), "Bar": bar})
+            if rows:
+                for row in sorted(rows, key=lambda r: r["Change %"], reverse=True):
+                    c1, c2, c3 = st.columns([2, 1, 2])
+                    c1.markdown(f"### {row['Bar']} {row['Stock']}")
+                    c2.metric("Price", f"{row['Price']:.2f}")
+                    c3.metric("Change", f"{row['Change %']:.2f}%")
+                    st.markdown("---")
+            else:
+                st.warning("Could not fetch stock data right now — try again in a moment.")
+
+# ---------------- TAB: WATCHLIST & PORTFOLIO ----------------
 with tab_watch:
-    st.header("📋 Watchlist & Portfolio"); st.session_state.setdefault("watchlist", ["RELIANCE.NS","TCS.NS","INFY.NS","AAPL","NVDA"]); add=st.text_input("Add ticker", key="watch_add")
-    if st.button("➕ Add", key="watch_add_button") and add and add.upper() not in st.session_state.watchlist: st.session_state.watchlist.append(add.upper())
-    rows=[]
-    for ticker in st.session_state.watchlist:
-        try:
-            fast=yf.Ticker(ticker).fast_info; last=float(fast.get("last_price",0)); prev=float(fast.get("previous_close",last)); rows.append({"Ticker":ticker,"Price":last,"Change %":round((last-prev)/prev*100 if prev else 0,2)})
-        except Exception: rows.append({"Ticker":ticker,"Price":"N/A","Change %":"N/A"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-    st.subheader("💼 Portfolio Tracker"); st.session_state.setdefault("portfolio", {}); p1,p2,p3=st.columns(3)
-    with p1: pticker=st.text_input("Ticker",key="portfolio_ticker")
-    with p2: pqty=st.number_input("Quantity",min_value=1,value=1,key="portfolio_qty")
-    with p3: pbuy=st.number_input("Buy price",min_value=.01,value=100.,key="portfolio_buy")
-    if st.button("Add holding",key="portfolio_add") and pticker: st.session_state.portfolio[pticker.upper()]={"qty":pqty,"buy":pbuy}
-    for ticker,data in st.session_state.portfolio.items():
-        try:
-            last=float(yf.Ticker(ticker).fast_info.get("last_price",0)); pnl=(last-data["buy"])*data["qty"]; st.metric(ticker,f"{last:.2f}",f"P&L {pnl:.2f}")
-        except Exception: st.warning(f"Could not fetch {ticker}")
+    st.header("📋 Watchlist & Portfolio")
+    st.session_state.setdefault("watchlists", {"My Stocks": ["RELIANCE.NS", "TCS.NS", "INFY.NS"], "US Tech": ["AAPL", "MSFT", "NVDA"], "Crypto": ["BTC-USD", "ETH-USD"]})
+    st.session_state.setdefault("current_watchlist", "My Stocks")
 
+    wcol1, wcol2 = st.columns(2)
+    with wcol1:
+        st.subheader("📋 Watchlists")
+        new_list = st.text_input("New watchlist name", key="new_watchlist_name")
+        if st.button("➕ Create watchlist", key="create_watchlist") and new_list and new_list not in st.session_state.watchlists:
+            st.session_state.watchlists[new_list] = []
+            st.session_state.current_watchlist = new_list
+            st.rerun()
+        names = list(st.session_state.watchlists.keys())
+        chosen = st.selectbox("Select watchlist", names, index=names.index(st.session_state.current_watchlist) if st.session_state.current_watchlist in names else 0)
+        st.session_state.current_watchlist = chosen
+
+        add_ticker = st.text_input("Add ticker to this watchlist", key="watch_add")
+        if st.button("➕ Add", key="watch_add_button") and add_ticker:
+            t = add_ticker.upper().strip()
+            if t and t not in st.session_state.watchlists[chosen]:
+                st.session_state.watchlists[chosen].append(t)
+                st.rerun()
+
+        rows = []
+        for ticker in st.session_state.watchlists[chosen]:
+            last, change = fast_quote(ticker)
+            rows.append({"Ticker": ticker, "Price": round(last, 2) if last is not None else "N/A",
+                         "Change %": round(change, 2) if change is not None else "N/A"})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if st.session_state.watchlists[chosen]:
+            remove_choice = st.selectbox("Remove a ticker", ["—"] + st.session_state.watchlists[chosen], key="watch_remove_pick")
+            if st.button("🗑️ Remove", key="watch_remove_button") and remove_choice != "—":
+                st.session_state.watchlists[chosen].remove(remove_choice)
+                st.rerun()
+
+    with wcol2:
+        st.subheader("💼 Portfolio Tracker")
+        st.session_state.setdefault("portfolio", {})
+        p1, p2, p3 = st.columns(3)
+        with p1: pticker = st.text_input("Ticker", key="portfolio_ticker")
+        with p2: pqty = st.number_input("Quantity", min_value=1, value=1, key="portfolio_qty")
+        with p3: pbuy = st.number_input("Buy price", min_value=0.01, value=100.0, key="portfolio_buy")
+        if st.button("Add holding", key="portfolio_add") and pticker:
+            st.session_state.portfolio[pticker.upper()] = {"qty": pqty, "buy": pbuy}
+            st.rerun()
+        for ticker, data in list(st.session_state.portfolio.items()):
+            last, _ = fast_quote(ticker)
+            cols = st.columns([3, 1])
+            with cols[0]:
+                if last is not None:
+                    st.metric(ticker, f"{last:.2f}", f"P&L {(last - data['buy']) * data['qty']:.2f}")
+                else:
+                    st.warning(f"Could not fetch {ticker}")
+            with cols[1]:
+                if st.button("🗑️", key=f"remove_portfolio_{ticker}"):
+                    del st.session_state.portfolio[ticker]
+                    st.rerun()
+
+# ---------------- TAB: ALERTS & BACKTEST ----------------
 with tab_alerts:
-    st.header("🔔 Alerts & Backtest"); st.session_state.setdefault("alerts", []); x1,x2,x3=st.columns(3)
-    with x1: aticker=st.text_input("Alert ticker",key="alert_ticker")
-    with x2: avalue=st.number_input("Alert price",min_value=.01,value=100.,key="alert_value")
-    with x3: adirection=st.selectbox("Condition",["Above","Below"],key="alert_direction")
-    if st.button("Create alert",key="create_alert") and aticker: st.session_state.alerts.append({"ticker":aticker.upper(),"price":avalue,"direction":adirection})
-    for alert in st.session_state.alerts:
-        try:
-            last=float(yf.Ticker(alert["ticker"]).fast_info.get("last_price",0)); hit=(alert["direction"]=="Above" and last>=alert["price"]) or (alert["direction"]=="Below" and last<=alert["price"]); (st.error if hit else st.info)(f"{alert['ticker']} {alert['direction']} {alert['price']:.2f} · Current {last:.2f}")
-        except Exception: st.warning(f"Could not fetch {alert['ticker']}")
-    st.subheader("🧪 Backtesting"); b1,b2=st.columns(2)
-    with b1: bticker=st.text_input("Backtest ticker",symbol,key="bticker")
-    with b2: strategy=st.selectbox("Strategy",["Buy at S1","Sell at R1"],key="bstrategy")
-    start=st.date_input("Start",datetime.now()-timedelta(days=90),key="bstart"); end=st.date_input("End",datetime.now(),key="bend")
-    if st.button("🚀 Run Backtest",key="run_backtest"):
-        result=backtest(bticker,start,end,strategy); st.json(result) if result else st.error("Backtest failed")
+    st.header("🔔 Alerts & Backtest")
+    st.session_state.setdefault("alerts", [])
+    x1, x2, x3 = st.columns(3)
+    with x1: aticker = st.text_input("Alert ticker", value=symbol, key="alert_ticker")
+    with x2: avalue = st.number_input("Alert price", min_value=0.01, value=float(round(price, 2)), key="alert_value")
+    with x3: adirection = st.selectbox("Condition", ["Above", "Below"], key="alert_direction")
+    if st.button("Create alert", key="create_alert") and aticker:
+        st.session_state.alerts.append({"ticker": aticker.upper(), "price": avalue, "direction": adirection, "notified": False})
+        st.rerun()
 
+    if st.session_state.alerts:
+        st.subheader("📋 Active Reminders")
+        for idx, alert in enumerate(list(st.session_state.alerts)):
+            last, _ = fast_quote(alert["ticker"])
+            last = last if last is not None else 0.0
+            hit = (alert["direction"] == "Above" and last >= alert["price"]) or (alert["direction"] == "Below" and last <= alert["price"])
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                (st.error if hit else st.info)(f"{alert['ticker']} {alert['direction']} {alert['price']:.2f} · Current {last:.2f}")
+            with c2:
+                if st.button("❌ Cancel", key=f"cancel_alert_{idx}"):
+                    st.session_state.alerts.pop(idx)
+                    st.rerun()
+            if hit and not alert.get("notified"):
+                sent = send_telegram_alert(f"🚨 <b>PRICE ALERT</b>\n{alert['ticker']} is now {alert['direction']} {alert['price']:.2f}\nCurrent: {last:.2f}")
+                if sent:
+                    st.session_state.alerts[idx]["notified"] = True
+
+    st.subheader("🧪 Backtesting")
+    b1, b2 = st.columns(2)
+    with b1: bticker = st.text_input("Backtest ticker", symbol, key="bticker")
+    with b2: strategy = st.selectbox("Strategy", ["Buy at S1", "Sell at R1"], key="bstrategy")
+    start = st.date_input("Start", datetime.now() - timedelta(days=90), key="bstart")
+    end = st.date_input("End", datetime.now(), key="bend")
+    if st.button("🚀 Run Backtest", key="run_backtest"):
+        result = backtest(bticker, start, end, strategy)
+        st.json(result) if result else st.error("Backtest failed — check the ticker.")
+
+# ---------------- TAB: HISTORICAL DATA ----------------
 with tab_history:
-    st.header("📅 Historical Data"); period=st.selectbox("Period",["1mo","3mo","6mo","1y"],key="history_period"); hist=yf.Ticker(symbol).history(period=period,interval="1d")
-    if hist.empty: st.warning("No historical data")
-    else: st.dataframe(hist[["Open","High","Low","Close","Volume"]].tail(100),use_container_width=True); st.line_chart(hist["Close"])
+    st.header(f"📅 Historical Data — {symbol}")
+    st.caption("Last 2 trading sessions (auto-adjusts across weekends/holidays — yfinance only returns real trading candles) plus long-term swing support/resistance.")
 
-st.caption("News relevance, sentiment, and impact explanations are heuristic/AI-assisted and are not investment advice.")
+    days = get_two_day_intraday(symbol)
+    if not days:
+        st.warning("No intraday history available for this symbol.")
+    else:
+        for day in days:
+            st.markdown(f"#### 📅 {day['date']}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Open", f"{day['open']:.2f}")
+            c2.metric("High", f"{day['high']:.2f}")
+            c3.metric("Low", f"{day['low']:.2f}")
+            c4.metric("Close", f"{day['close']:.2f}")
+            rows = [{"Level": lvl["label"], "Price": round(lvl["value"], 2)} for lvl in reversed(day["ladder"])]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.markdown("---")
+
+    st.subheader("📐 Long-Term Swing Support / Resistance (6-month)")
+    swing_df = get_swing_data(symbol)
+    if swing_df.empty or len(swing_df) < 30:
+        st.info("Not enough long-term history to compute swing levels for this symbol.")
+    else:
+        res_levels, sup_levels = swing_levels(swing_df)
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            st.markdown("**🔴 Swing Resistance**")
+            for r in res_levels:
+                st.markdown(f"- {r:.2f}")
+            if not res_levels:
+                st.caption("None found.")
+        with sc2:
+            st.markdown("**🟢 Swing Support**")
+            for s in sup_levels:
+                st.markdown(f"- {s:.2f}")
+            if not sup_levels:
+                st.caption("None found.")
+
+st.caption("Gann ladder, order blocks, golden pockets, news impact, and AI suggestions are heuristic/AI-assisted and are not investment advice.")
