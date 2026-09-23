@@ -1,6 +1,7 @@
 import email.utils
 import html as html_module
 import math
+import os
 import re
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -19,9 +20,10 @@ st.set_page_config(page_title="AI Institutional Terminal", layout="wide")
 # ================== SECRETS ==================
 def secret(name):
     try:
-        return st.secrets.get(name, "")
+        configured = st.secrets.get(name, "")
+        return configured or os.getenv(name, "")
     except Exception:
-        return ""
+        return os.getenv(name, "")
 
 
 GROQ_KEY = secret("GROQ_KEY")
@@ -162,13 +164,26 @@ def yahoo_search(query, limit=8):
 
 @st.cache_data(ttl=10)
 def fast_quote(ticker):
-    """Real-time-ish last price + % change via yfinance's lightweight fast_info."""
+    """Fetch a current-ish quote, falling back to recent daily closes when needed."""
     try:
         fi = yf.Ticker(ticker).fast_info
         last = float(fi.get("last_price") or 0)
-        prev = float(fi.get("previous_close") or last)
-        change = ((last - prev) / prev * 100) if prev else 0.0
-        return last, change
+        prev = float(fi.get("previous_close") or 0)
+        if last > 0 and prev > 0 and math.isfinite(last) and math.isfinite(prev):
+            return last, (last - prev) / prev * 100
+    except Exception:
+        pass
+
+    try:
+        history = yf.Ticker(ticker).history(period="5d", interval="1d", auto_adjust=False)
+        closes = pd.to_numeric(history.get("Close"), errors="coerce").dropna()
+        if closes.empty:
+            return None, None
+        last = float(closes.iloc[-1])
+        prev = float(closes.iloc[-2]) if len(closes) > 1 else last
+        if last <= 0 or not math.isfinite(last) or prev <= 0 or not math.isfinite(prev):
+            return None, None
+        return last, (last - prev) / prev * 100 if prev else 0.0
     except Exception:
         return None, None
 
