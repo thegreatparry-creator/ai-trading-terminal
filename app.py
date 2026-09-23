@@ -75,7 +75,7 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 HTTP_UA = "Mozilla/5.0 (compatible; AI-Trade-Terminal/3.0; +https://streamlit.io)"
 
 # ---------------------------------------------------------------------------
@@ -335,6 +335,22 @@ class AIProvider:
         raise AIUnavailable("This provider is not implemented.")
 
 
+def provider_key(provider: str) -> str:
+    """v3.1.1: first configured secret among common alias names.
+
+    Accepts GROQ_KEY or GROQ_API_KEY, and GEMINI_KEY / GEMINI_API_KEY /
+    GOOGLE_API_KEY - so the chat works no matter which name you add to
+    secrets. The value is never logged.
+    """
+    aliases = ("GROQ_KEY", "GROQ_API_KEY") if provider == "groq" else \
+              ("GEMINI_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+    for name in aliases:
+        value = secret(name)
+        if value:
+            return value
+    return ""
+
+
 class GroqProvider(AIProvider):
     label = "Groq"
     supports_tools = True
@@ -342,13 +358,15 @@ class GroqProvider(AIProvider):
     def _client(self):
         if Groq is None:
             raise AIUnavailable("The `groq` package is not installed in this deployment.")
-        key = secret("GROQ_KEY")
+        key = provider_key("groq")
         if not key:
-            raise AIUnavailable("GROQ_KEY is not configured. Add it in Streamlit → Settings → Secrets.")
+            raise AIUnavailable("No Groq key found. Add GROQ_KEY (or GROQ_API_KEY) to "
+                                ".streamlit/secrets.toml or Streamlit → Settings → Secrets. "
+                                "Free key: console.groq.com")
         return Groq(api_key=key)
 
     def is_configured(self) -> bool:
-        return bool(secret("GROQ_KEY")) and Groq is not None
+        return bool(provider_key("groq")) and Groq is not None
 
     @staticmethod
     def _payload(system: str, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -418,13 +436,15 @@ class GeminiProvider(AIProvider):
     def _client(self):
         if google_genai is None:
             raise AIUnavailable("The `google-genai` package is not installed in this deployment.")
-        key = secret("GEMINI_KEY")
+        key = provider_key("gemini")
         if not key:
-            raise AIUnavailable("GEMINI_KEY is not configured. Add it in Streamlit → Settings → Secrets.")
+            raise AIUnavailable("No Gemini key found. Add GEMINI_KEY (or GEMINI_API_KEY / "
+                                "GOOGLE_API_KEY) to .streamlit/secrets.toml or Streamlit → "
+                                "Settings → Secrets. Free key: aistudio.google.com")
         return google_genai.Client(api_key=key)
 
     def is_configured(self) -> bool:
-        return bool(secret("GEMINI_KEY")) and google_genai is not None
+        return bool(provider_key("gemini")) and google_genai is not None
 
     @staticmethod
     def _contents(messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
@@ -493,8 +513,8 @@ def ai_diagnostics() -> Dict[str, Any]:
         "app_version": APP_VERSION,
         "groq_package": Groq is not None,
         "gemini_package": google_genai is not None,
-        "groq_key_configured": bool(secret("GROQ_KEY")),
-        "gemini_key_configured": bool(secret("GEMINI_KEY")),
+        "groq_key_configured": bool(provider_key("groq")),
+        "gemini_key_configured": bool(provider_key("gemini")),
         "telegram_configured": bool(secret("TELEGRAM_BOT_TOKEN") and secret("TELEGRAM_CHAT_ID")),
     }
 
@@ -2050,10 +2070,16 @@ def parse_news_items(raw: Any, symbol: str = "", limit: int = 20) -> List[Dict[s
             link = safe_news_link(entry)
             image = safe_news_image(entry)
             stamp = (entry.get("providerPublishTime") or entry.get("published")
-                     or content.get("pubDate") or content.get("displayTime")
+                     or content.get("pubDate") or content.get("datePublished")
+                     or content.get("displayTime")
                      or entry.get("pubDate") or entry.get("time"))
             published = None
-            if isinstance(stamp, (int, float)):
+            if isinstance(stamp, datetime):
+                # v3.1.1 FIX: already a normalized datetime (fetch_news re-parses
+                # its own parsed items) - the old int/float/str-only chain dropped
+                # it and every headline showed "time unknown".
+                published = stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+            elif isinstance(stamp, (int, float)):
                 try:
                     published = datetime.fromtimestamp(float(stamp), tz=timezone.utc)
                 except Exception:
