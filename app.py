@@ -4,26 +4,38 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import math
+import re
+import html as html_module
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import email.utils
 from datetime import datetime, timezone, timedelta
 from groq import Groq
-import google.generativeai as genai
+from google import genai as google_genai
 import requests
 
 
 # ================== API KEYS ==================
-GEMINI_KEY = "AQ.Ab8RN6JtGdVf9VFtpeo2_7BYDuZQZZlhMIbQxKFX1noZ4UnTSQ"
-GROQ_KEY = "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"
-TELEGRAM_BOT_TOKEN = "8794257218:AAGYGDqPUEJdI3UahL07Pe86IgcLCfIn20g"
-TELEGRAM_CHAT_ID = "8600332637"
+# ⚠️ SECURITY NOTE: these were hardcoded in the original file. Anything pasted into a
+# chat/shared file should be treated as compromised — please rotate all 4 of these
+# (Gemini, Groq, Telegram bot token) in their respective dashboards, then keep the new
+# ones ONLY in .streamlit/secrets.toml (never in code you share or commit). The helper
+# below reads from st.secrets first and only falls back to the old hardcoded value so
+# the app keeps working until you migrate.
+def _get_secret(key, fallback):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return fallback
+
+GEMINI_KEY = _get_secret("GEMINI_KEY", "AQ.Ab8RN6JtGdVf9VFtpeo2_7BYDuZQZZlhMIbQxKFX1noZ4UnTSQ")
+GROQ_KEY = _get_secret("GROQ_KEY", "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")
 
 
 # ================== TELEGRAM BOT CONFIG ==================
-TELEGRAM_BOT_TOKEN = "8794257218:AAGYGDqPUEJdI3UahL07Pe86IgcLCfIn20g"
-TELEGRAM_CHAT_ID = "8600332637"
+TELEGRAM_BOT_TOKEN = _get_secret("TELEGRAM_BOT_TOKEN", "8794257218:AAGYGDqPUEJdI3UahL07Pe86IgcLCfIn20g")
+TELEGRAM_CHAT_ID = _get_secret("TELEGRAM_CHAT_ID", "8600332637")
 
 
 def send_telegram_alert(message):
@@ -38,42 +50,145 @@ def send_telegram_alert(message):
 
 
 groq_client = Groq(api_key=GROQ_KEY)
-genai.configure(api_key=GEMINI_KEY)
+gemini_client = google_genai.Client(api_key=GEMINI_KEY)
+
+
+# ================== AI MODEL MAPS ==================
+# Groq retired llama-3.1-8b-instant / llama-3.3-70b-versatile for free & dev-tier keys
+# (Aug 16, 2026), and mixtral-8x7b-32768 / gemma2-9b-it were removed even earlier.
+# These are the current production/preview models on a normal Groq API key.
+GROQ_MODEL_MAP = {
+    "Groq (GPT-OSS 20B - Fast)": "openai/gpt-oss-20b",
+    "Groq (GPT-OSS 120B - Smartest)": "openai/gpt-oss-120b",
+    "Groq (Qwen3 32B)": "qwen/qwen3-32b",
+    "Groq (Kimi K2)": "moonshotai/kimi-k2-instruct",
+}
+
+# google-generativeai (the old "import google.generativeai as genai" SDK) is deprecated
+# and gemini-1.5-* models are long retired. Using the current google-genai SDK instead.
+GEMINI_MODEL_MAP = {
+    "Gemini 3.5 Flash": "gemini-3.5-flash",
+    "Gemini 3.1 Pro (Preview)": "gemini-3.1-pro-preview",
+}
 
 
 # ================== PAGE CONFIG ==================
 st.set_page_config(page_title="AI Institutional Terminal", layout="wide")
+
+# Mobile-friendly typography & news-card styling. Streamlit already stacks columns on
+# narrow screens; this just makes text sizes and tap targets comfortable for someone
+# scanning charts/news on a phone during market hours.
+st.markdown("""
+<style>
+    html, body, [class*="css"]  { font-size: 16px; }
+    h1 { font-size: 1.65rem !important; }
+    h2 { font-size: 1.3rem !important; }
+    h3 { font-size: 1.12rem !important; }
+    div[data-testid="stMetricValue"] { font-size: 1.3rem !important; }
+    div[data-testid="stMetricLabel"] { font-size: 0.82rem !important; }
+    .stButton>button { padding: 0.5rem 1rem; font-size: 1rem; border-radius: 8px; }
+    .news-card {
+        border: 1px solid rgba(150,150,150,0.28);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-bottom: 12px;
+    }
+    .news-title { font-size: 1.05rem; font-weight: 700; line-height: 1.35; margin-bottom: 5px; }
+    .news-summary { font-size: 0.95rem; line-height: 1.5; opacity: 0.85; margin-bottom: 7px; }
+    .news-meta { font-size: 0.78rem; opacity: 0.6; }
+    .news-meta a { text-decoration: none; }
+    @media (max-width: 640px) {
+        h1 { font-size: 1.35rem !important; }
+        h2 { font-size: 1.15rem !important; }
+        .news-title { font-size: 1.08rem; }
+        .news-summary { font-size: 0.98rem; }
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🎯 AI Trading Terminal - PRO")
 
 
+def yahoo_symbol_search(query, max_results=8):
+    """Looks up ANY stock/index/crypto/forex symbol worldwide via Yahoo Finance's
+    search endpoint, so the user can type a company/index name instead of guessing
+    the exact ticker + suffix (e.g. 'Nifty 50' correctly resolves to ^NSEI)."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        resp = requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": query, "quotesCount": max_results, "newsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        results = []
+        for q in resp.json().get("quotes", []):
+            symbol = q.get("symbol")
+            if not symbol:
+                continue
+            results.append({
+                "symbol": symbol,
+                "name": q.get("shortname") or q.get("longname") or symbol,
+                "exchange": q.get("exchange", ""),
+                "type": q.get("quoteType", ""),
+            })
+        return results
+    except Exception as e:
+        print(f"Symbol search error: {e}")
+        return []
+
+
 # ================== SIDEBAR ==================
-st.sidebar.header("🌐 Market Selection")
-select_market = st.sidebar.selectbox("Asset Class / Country",
-    ["India - NSE (.NS)", "India Index Benchmark", "United States (No Suffix)", "Cryptocurrency (-USD)", "Forex Currency (=X)", "Commodities", "Global Indices"])
+st.sidebar.header("🔍 Search Any Stock / Index / Crypto Worldwide")
+global_query = st.sidebar.text_input("Type a name or ticker — e.g. 'Nifty 50', 'Apple', 'Reliance', 'Bitcoin', 'EURUSD'", key="global_search_query")
 
+symbol_override = None
+if global_query.strip():
+    search_results = yahoo_symbol_search(global_query)
+    if search_results:
+        options = [f"{r['symbol']} — {r['name']} ({r['exchange']} · {r['type']})" for r in search_results]
+        picked = st.sidebar.radio("Matching symbols", options, key="global_search_pick")
+        symbol_override = search_results[options.index(picked)]["symbol"]
+    else:
+        st.sidebar.caption("No matches found. Try a different spelling, or use the manual selector below.")
 
-default_symbol = "RELIANCE"
-if select_market == "India Index Benchmark": default_symbol = "^NSEI"
-elif select_market == "United States (No Suffix)": default_symbol = "AAPL"
-elif select_market == "Cryptocurrency (-USD)": default_symbol = "BTC-USD"
-elif select_market == "Forex Currency (=X)": default_symbol = "EURUSD=X"
-elif select_market == "Commodities": default_symbol = "GC=F"
-elif select_market == "Global Indices": default_symbol = "^GSPC"
-else: default_symbol = "RELIANCE"
+with st.sidebar.expander("⚙️ Manual selector (if you already know the exact suffix)", expanded=not bool(global_query.strip())):
+    select_market = st.selectbox("Asset Class / Country",
+        ["India - NSE (.NS)", "India Index Benchmark", "United States (No Suffix)", "Cryptocurrency (-USD)", "Forex Currency (=X)", "Commodities", "Global Indices"])
 
+    default_symbol = "RELIANCE"
+    if select_market == "India Index Benchmark": default_symbol = "^NSEI"
+    elif select_market == "United States (No Suffix)": default_symbol = "AAPL"
+    elif select_market == "Cryptocurrency (-USD)": default_symbol = "BTC-USD"
+    elif select_market == "Forex Currency (=X)": default_symbol = "EURUSD=X"
+    elif select_market == "Commodities": default_symbol = "GC=F"
+    elif select_market == "Global Indices": default_symbol = "^GSPC"
+    else: default_symbol = "RELIANCE"
 
-search_ticker = st.sidebar.text_input("Enter Ticker / Symbol", default_symbol).strip().upper()
+    search_ticker = st.text_input("Enter Ticker / Symbol", default_symbol).strip().upper()
 
+    if select_market == "India - NSE (.NS)" and not search_ticker.endswith(".NS"): manual_symbol = f"{search_ticker}.NS"
+    elif select_market == "Cryptocurrency (-USD)" and not search_ticker.endswith("-USD"): manual_symbol = f"{search_ticker}-USD"
+    elif select_market == "Forex Currency (=X)" and not search_ticker.endswith("=X"): manual_symbol = f"{search_ticker}=X"
+    elif select_market == "Commodities" and not search_ticker.endswith("=F"): manual_symbol = f"{search_ticker}=F"
+    else: manual_symbol = search_ticker
 
-if select_market == "India - NSE (.NS)" and not search_ticker.endswith(".NS"): full_symbol = f"{search_ticker}.NS"
-elif select_market == "Cryptocurrency (-USD)" and not search_ticker.endswith("-USD"): full_symbol = f"{search_ticker}-USD"
-elif select_market == "Forex Currency (=X)" and not search_ticker.endswith("=X"): full_symbol = f"{search_ticker}=X"
-elif select_market == "Commodities" and not search_ticker.endswith("=F"): full_symbol = f"{search_ticker}=F"
-else: full_symbol = search_ticker
+# The universal search result (if the person picked one) always wins over the manual
+# selector — that's what actually fixes "NIFTY.NS has no data": searching "Nifty 50"
+# correctly resolves to ^NSEI instead of guessing a wrong suffix.
+if symbol_override:
+    full_symbol = symbol_override
+    search_ticker = symbol_override
+else:
+    full_symbol = manual_symbol
 
 
 st.sidebar.markdown("---")
 st.sidebar.header("📡 Global News Sources")
+# Global news sources - scans all, shows relevant
 global_news_sources = [
     "https://www.moneycontrol.com/rss/latestnews.xml",
     "https://alphaideas.in/feed",
@@ -144,17 +259,36 @@ if st.sidebar.button("🧪 Test Telegram Alert"):
 
 
 # ================== HELPER FUNCTIONS ==================
+def clean_news_summary(raw_html, max_sentences=3, max_chars=240):
+    """Turns a raw RSS <description> (often HTML) into a clean 1-3 line summary."""
+    if not raw_html:
+        return ""
+    text = re.sub(r'<[^<]+?>', ' ', raw_html)          # strip HTML tags
+    text = html_module.unescape(text)                   # &amp; -> &, etc.
+    text = re.sub(r'\s+', ' ', text).strip()
+    if not text:
+        return ""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    text = ' '.join(sentences[:max_sentences]).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(' ', 1)[0].rstrip(',.;:') + "…"
+    return text
+
+
 def harvest_global_news():
+    """Fetch news from ALL global sources, keeping a short summary for each headline."""
     news_items = []
     for url in global_news_sources:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=3) as resp:
                 root = ET.fromstring(resp.read())
-                for item in root.findall(".//item")[:5]:
+                for item in root.findall(".//item")[:8]:  # wider pool per source so relevance filtering has enough to work with
                     title = item.findtext("title", "").strip()
                     link = item.findtext("link", "").strip()
                     pub = item.findtext("pubDate", "").strip()
+                    raw_desc = item.findtext("description", "") or ""
+                    summary = clean_news_summary(raw_desc) or title
                     source = item.find("source").text.strip() if item.find("source") is not None else "Global News"
                     is_breaking = False
                     try:
@@ -170,10 +304,38 @@ def harvest_global_news():
                     for w in ["slumps", "falls", "drops", "loss", "sell", "crash", "decline"]:
                         if w in title_lower: score -= 1
                     score = max(-3, min(3, score))
-                    news_items.append({"title": title, "link": link, "source": source, "time": pub, "impact": score, "is_breaking": is_breaking})
+                    news_items.append({"title": title, "summary": summary, "link": link, "source": source, "time": pub, "impact": score, "is_breaking": is_breaking})
         except Exception as e:
             print(f"News source error: {e}")
-    return news_items[:20]
+    return news_items[:60]  # a wider pool; the stock-relevance filter picks the best 5-8 later
+
+
+def get_relevance_keywords(search_ticker, stock_info):
+    """Keywords used to decide whether a headline is actually about the selected stock."""
+    raw = re.sub(r'(\.NS|-USD|=X|=F)$', '', search_ticker or "").strip().lower()
+    keywords = {raw} if raw else set()
+    name = (stock_info or {}).get("longName") or (stock_info or {}).get("shortName") or ""
+    if name:
+        name_lower = name.lower()
+        keywords.add(name_lower)
+        first_word = name_lower.split()[0] if name_lower.split() else ""
+        if len(first_word) > 2:
+            keywords.add(first_word)
+    return [k for k in keywords if k and len(k) > 1]
+
+
+def filter_relevant_news(news_list, keywords, max_items=8):
+    """Keeps only headlines that actually mention the stock/company, best matches first."""
+    if not keywords:
+        return []
+    scored = []
+    for n in news_list:
+        haystack = f"{n['title']} {n.get('summary', '')}".lower()
+        hits = sum(1 for k in keywords if k in haystack)
+        if hits > 0:
+            scored.append((hits, n))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [n for _, n in scored][:max_items]
 
 
 def detect_patterns(df):
@@ -214,6 +376,127 @@ def calculate_levels(df, first_15m_open=None):
         "pattern": detect_patterns(df),
         **gann_levels
     }
+
+
+def build_gann_ladder(quant, open_price):
+    """
+    Builds one sorted ladder of every Gann-angle level (all resistances + all supports)
+    PLUS the 0-degree opening price used as the anchor for the whole square-of-9 grid.
+    This is what lets us say 'price is currently between level X and level Y' for
+    whatever degree those two levels happen to be — exactly like the ladder shown in
+    the reference clip (22.5°, 45°, 67.5°, 90°, 180° stacked above/below the open).
+    """
+    degs = [22.5, 45, 67.5, 90, 180]
+    ladder = [{"label": "0° (Open)", "deg": 0.0, "side": "OPEN", "value": float(open_price)}]
+    for d in degs:
+        r_val, s_val = quant.get(f"R_{d}"), quant.get(f"S_{d}")
+        if r_val is not None:
+            ladder.append({"label": f"{d}° R", "deg": d, "side": "R", "value": float(r_val)})
+        if s_val is not None:
+            ladder.append({"label": f"{d}° S", "deg": d, "side": "S", "value": float(s_val)})
+    ladder.sort(key=lambda x: x["value"])
+    return ladder
+
+
+def locate_price_band(ladder, price):
+    """
+    Returns (lower_level, upper_level) — the two consecutive ladder levels the current
+    price is sitting between right now — or the string 'below'/'above' if price has
+    broken outside every calculated level (breakdown/breakout zone).
+    """
+    if not ladder:
+        return "below"
+    if price <= ladder[0]["value"]:
+        return "below"
+    if price >= ladder[-1]["value"]:
+        return "above"
+    for i in range(len(ladder) - 1):
+        if ladder[i]["value"] <= price <= ladder[i + 1]["value"]:
+            return ladder[i], ladder[i + 1]
+    return "below"
+
+
+def get_chart_zoom_window(ladder, band, price, context=1):
+    """
+    Picks a sane y-axis window: the current band plus `context` extra levels on each
+    side, instead of the full ladder — which is what made the chart unreadable for
+    instruments like EURUSD=X where far-out levels dwarf the tight real trading range.
+    """
+    if not ladder:
+        return None
+    if isinstance(band, tuple):
+        lo_idx, hi_idx = ladder.index(band[0]), ladder.index(band[1])
+    else:
+        lo_idx, hi_idx = 0, len(ladder) - 1
+    start = max(0, lo_idx - context)
+    end = min(len(ladder) - 1, hi_idx + context)
+    window = ladder[start:end + 1]
+    window_vals = [lvl["value"] for lvl in window] + [price]
+    y_min, y_max = min(window_vals), max(window_vals)
+    pad = (y_max - y_min) * 0.18 if y_max > y_min else max(abs(price) * 0.01, 0.0001)
+    return y_min - pad, y_max + pad, window
+
+
+def detect_order_block(price_df, lookback=60, impulse_atr_mult=1.8, search_back=6):
+    """
+    Simplified Smart-Money-Concepts order block detector: scans recent candles for a
+    strong impulsive move (body much bigger than the recent average range), then marks
+    the last opposite-colored candle right before that move as the order block zone —
+    a bullish OB (demand) before an up-impulse, a bearish OB (supply) before a down-impulse.
+    This is a simplified heuristic, not a certified SMC/ICT tool — treat it as a zone to
+    watch, not a signal on its own.
+    """
+    if price_df is None or len(price_df) < 15:
+        return None
+    d = price_df.tail(lookback).copy()
+    d["body"] = (d["Close"] - d["Open"]).abs()
+    d["range"] = d["High"] - d["Low"]
+    atr = d["range"].rolling(14, min_periods=5).mean()
+    bullish_ob, bearish_ob = None, None
+    for i in range(len(d) - 2, 0, -1):
+        a = atr.iloc[i]
+        if pd.isna(a) or a == 0:
+            continue
+        if d["body"].iloc[i] <= impulse_atr_mult * a:
+            continue
+        moved_up = d["Close"].iloc[i] > d["Open"].iloc[i]
+        moved_down = d["Close"].iloc[i] < d["Open"].iloc[i]
+        if moved_up and bullish_ob is None:
+            for j in range(i - 1, max(i - search_back, -1), -1):
+                if d["Close"].iloc[j] < d["Open"].iloc[j]:
+                    bullish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j]), "time": d.index[j]}
+                    break
+        if moved_down and bearish_ob is None:
+            for j in range(i - 1, max(i - search_back, -1), -1):
+                if d["Close"].iloc[j] > d["Open"].iloc[j]:
+                    bearish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j]), "time": d.index[j]}
+                    break
+        if bullish_ob and bearish_ob:
+            break
+    if not bullish_ob and not bearish_ob:
+        return None
+    return {"bullish": bullish_ob, "bearish": bearish_ob}
+
+
+def detect_golden_pocket(price_df, lookback=80):
+    """
+    Finds the most recent significant swing high/low in the lookback window and returns
+    the 61.8%-65% Fibonacci retracement zone ('golden pocket'), plus whether the current
+    price is sitting inside it right now.
+    """
+    if price_df is None or len(price_df) < 15:
+        return None
+    d = price_df.tail(lookback)
+    swing_high, swing_low = float(d["High"].max()), float(d["Low"].min())
+    diff = swing_high - swing_low
+    if diff <= 0:
+        return None
+    uptrend = d["Low"].idxmin() < d["High"].idxmax()  # low printed first -> this is a pullback in an up-move
+    if uptrend:
+        gp_low, gp_high = swing_high - diff * 0.65, swing_high - diff * 0.618
+    else:
+        gp_low, gp_high = swing_low + diff * 0.618, swing_low + diff * 0.65
+    return {"gp_low": gp_low, "gp_high": gp_high, "swing_high": swing_high, "swing_low": swing_low, "uptrend": uptrend}
 
 
 def get_15min_data(symbol):
@@ -260,39 +543,38 @@ def get_historical_15min_days(symbol, days=2):
 def get_groq_suggestions(symbol, quant, news_dossier):
     prompt = f"Analyze {symbol}: Price={quant['price']}, Pattern={quant['pattern']}, R1={quant['r1']}, S1={quant['s1']}\nNews: {news_dossier}\n\nGive INTRADAY and SWING suggestions with ENTRY, SL, TP."
     try:
-        res = groq_client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": prompt}], temperature=0.2)
+        res = groq_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
         return res.choices[0].message.content
-    except: return "AI unavailable"
+    except Exception as e:
+        return f"⚠️ AI Error (Groq): {type(e).__name__}: {e}"
 
 
 def get_chat_response(user_message, context_text, model_choice):
     system_prompt = f"Trading assistant. Context: {context_text}. Answer questions. Educational only."
     try:
-        if model_choice == "Groq (Llama 3.1 8B)":
-            response = groq_client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}], temperature=0.3, max_tokens=800)
+        if model_choice in GROQ_MODEL_MAP:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL_MAP[model_choice],
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
+                temperature=0.3, max_tokens=800
+            )
             return response.choices[0].message.content
-        elif model_choice == "Groq (Gemma 2 9B)":
-            response = groq_client.chat.completions.create(model="gemma2-9b-it", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}], temperature=0.3, max_tokens=800)
-            return response.choices[0].message.content
-        elif model_choice == "Groq (Mixtral 8x7B)":
-            response = groq_client.chat.completions.create(model="mixtral-8x7b-32768", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}], temperature=0.3, max_tokens=800)
-            return response.choices[0].message.content
-        elif model_choice == "Groq (Llama 3.3 70B)":
-            response = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}], temperature=0.3, max_tokens=800)
-            return response.choices[0].message.content
-        elif model_choice == "Gemini 1.5 Flash":
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            response = model.generate_content(f"{system_prompt}\n\nQ: {user_message}")
-            return response.text
-        elif model_choice == "Gemini 1.5 Pro":
-            model = genai.GenerativeModel('gemini-1.5-pro')
-            response = model.generate_content(f"{system_prompt}\n\nQ: {user_message}")
+        elif model_choice in GEMINI_MODEL_MAP:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL_MAP[model_choice],
+                contents=f"{system_prompt}\n\nQ: {user_message}"
+            )
             return response.text
         else:
-            return "Invalid model selected"
+            return "⚠️ Invalid model selected"
     except Exception as e:
-        print(f"AI Error: {e}")
-        return "Error"
+        # Surface the REAL reason (bad key, rate limit, retired model, etc.) instead of
+        # a generic "Error" so it's actually possible to debug from the chat UI.
+        return f"⚠️ AI Error ({model_choice}): {type(e).__name__}: {e}"
 
 
 def run_backtest(symbol, start_date, end_date, strategy):
@@ -360,110 +642,164 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 with tab1:
     st.header(f"📊 Live Analysis: {full_symbol}")
     if df.empty or len(df) < 5:
-        st.error(f"❌ No data for {full_symbol}")
+        st.error(f"❌ No data for {full_symbol}. Use the universal search box in the sidebar to find the right symbol (e.g. search 'Nifty 50' instead of typing NIFTY.NS).")
     else:
         df_15m, opening_15m = get_cached_15min_data(full_symbol)
         quant = calculate_levels(df, opening_15m)
         st.session_state.quant_data = quant
         news_list = get_cached_global_news()
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("💰 Current Price", f"{quant['price']:.2f}")
-        col2.metric("📊 Pattern", quant['pattern'])
-        col3.metric("📈 Pivot", f"{quant['pivot']:.2f}")
-        
-        st.markdown("### 🎯 Gann Angle Levels (Based on 15m Open)")
-        gann_rows = []
-        current_price = quant['price']
-        for deg in ["22.5°", "45°", "67.5°", "90°", "180°"]:
-            r_key = f'R_{deg.replace("°", "")}'
-            s_key = f'S_{deg.replace("°", "")}'
-            r_raw = quant.get(r_key)
-            s_raw = quant.get(s_key)
-            try:
-                r_val = float(r_raw) if r_raw is not None else 0.0
-            except (ValueError, TypeError):
-                r_val = 0.0
-            try:
-                s_val = float(s_raw) if s_raw is not None else 0.0
-            except (ValueError, TypeError):
-                s_val = 0.0
-            gann_rows.append({"Angle": deg, "Resistance": r_val, "Support": s_val})
-        
-        all_levels = []
-        for row in gann_rows:
-            if row['Support'] > 0:
-                all_levels.append((row['Support'], f"S {row['Angle']}"))
-            if row['Resistance'] > 0:
-                all_levels.append((row['Resistance'], f"R {row['Angle']}"))
-        all_levels.sort(key=lambda x: x[0])
-        
-        price_between = ""
-        for i in range(len(all_levels) - 1):
-            lower_level = all_levels[i]
-            upper_level = all_levels[i + 1]
-            if lower_level[0] < current_price < upper_level[0]:
-                price_between = f"🟡 Price (${current_price:.2f}) is between {lower_level[1]} (${lower_level[0]:.2f}) and {upper_level[1]} (${upper_level[0]:.2f})"
-                break
-        
-        if current_price > all_levels[-1][0]:
-            price_between = f"🟢 Price (${current_price:.2f}) is ABOVE all levels"
-        elif current_price < all_levels[0][0]:
-            price_between = f"🔴 Price (${current_price:.2f}) is BELOW all levels"
-        
-        st.info(f"**0° (Center):** ${quant.get('price', 0):.2f}\n\n{price_between}")
-        
-        gann_df = pd.DataFrame(gann_rows)
-        st.dataframe(gann_df, use_container_width=True)
-        
-        st.markdown("### 🎯 Traditional Pivot Levels")
-        pivot_rows = []
-        for level in ["4", "3", "2", "1"]:
-            r_raw = quant.get(f'r{level}')
-            s_raw = quant.get(f's{level}')
-            try:
-                r_val = float(r_raw) if r_raw is not None else 0.0
-            except (ValueError, TypeError):
-                r_val = 0.0
-            try:
-                s_val = float(s_raw) if s_raw is not None else 0.0
-            except (ValueError, TypeError):
-                s_val = 0.0
-            pivot_rows.append({"Resistance": r_val, "Support": s_val})
-        levels_df = pd.DataFrame(pivot_rows, index=["Level 4", "Level 3", "Level 2", "Level 1"])
-        st.dataframe(levels_df, use_container_width=True)
-        
-        st.markdown("### 📍 Price Position")
-        price_status = []
-        for level_name in ['r4', 'r3', 'r2', 'r1', 's1', 's2', 's3', 's4']:
-            val = quant.get(level_name, 0)
-            try:
-                level_val = float(val) if val is not None else 0.0
-            except (ValueError, TypeError):
-                level_val = 0.0
-            status = "ABOVE" if quant['price'] > level_val else "BELOW"
-            price_status.append({"Level": level_name.upper(), "Price": f"${level_val:.2f}", "Current vs Level": status, "Gap": f"${abs(quant['price'] - level_val):.2f}"})
-        st.dataframe(pd.DataFrame(price_status), use_container_width=True)
-        
+        chart_df = df_15m if (df_15m is not None and not df_15m.empty) else df
+
+        col_main, col_ai = st.columns([2, 1], gap="large")
+
+        # ---------- MAIN LIVE ANALYSIS (left) ----------
+        with col_main:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("💰 Current Price", f"{quant['price']:.2f}")
+            c2.metric("📊 Pattern", quant['pattern'])
+            c3.metric("📈 Pivot", f"{quant['pivot']:.2f}")
+
+            st.markdown("---")
+            st.subheader("🎯 Live Price Position on Gann Ladder")
+            st.caption("0° = the opening price of the first 15-min candle. Every other degree is calculated from that anchor.")
+
+            open_ref = opening_15m if opening_15m else quant['price']
+            ladder = build_gann_ladder(quant, open_ref)
+            band = locate_price_band(ladder, quant['price'])
+
+            if band == "below":
+                st.warning(f"⬇️ Price **{quant['price']:.2f}** is BELOW every calculated level (lowest = {ladder[0]['label']} @ {ladder[0]['value']:.2f}) — possible breakdown zone.")
+            elif band == "above":
+                st.warning(f"⬆️ Price **{quant['price']:.2f}** is ABOVE every calculated level (highest = {ladder[-1]['label']} @ {ladder[-1]['value']:.2f}) — possible breakout zone.")
+            else:
+                lo, hi = band
+                st.success(f"💰 Price **{quant['price']:.2f}** is between **{lo['label']}** ({lo['value']:.2f}) and **{hi['label']}** ({hi['value']:.2f})")
+                span = hi['value'] - lo['value']
+                pct_into_band = ((quant['price'] - lo['value']) / span) if span else 0.0
+                st.progress(min(max(pct_into_band, 0.0), 1.0),
+                            text=f"{pct_into_band*100:.1f}% of the way from {lo['label']} to {hi['label']}")
+
+            # Zoomed, decluttered chart: only the current band + one level either side
+            if chart_df is not None and not chart_df.empty:
+                zoom = get_chart_zoom_window(ladder, band, quant['price'], context=1)
+                fig = go.Figure(data=[go.Candlestick(
+                    x=chart_df.index, open=chart_df['Open'], high=chart_df['High'],
+                    low=chart_df['Low'], close=chart_df['Close'], name=full_symbol)])
+                if zoom:
+                    y_min, y_max, visible_levels = zoom
+                    for lvl in visible_levels:
+                        color = "#26a69a" if lvl["side"] == "S" else ("#1e88e5" if lvl["side"] == "OPEN" else "#ef5350")
+                        fig.add_hline(y=lvl["value"], line_dash="dash", line_width=1.6, line_color=color, opacity=0.9,
+                                      annotation_text=f"{lvl['label']}  {lvl['value']:.2f}", annotation_position="left",
+                                      annotation_font_size=12, annotation_bgcolor="rgba(255,255,255,0.75)")
+                    if isinstance(band, tuple):
+                        fig.add_hrect(y0=band[0]["value"], y1=band[1]["value"], fillcolor="#ffe08a", opacity=0.18, line_width=0)
+                    fig.update_yaxes(range=[y_min, y_max])
+                fig.update_layout(height=460, xaxis_rangeslider_visible=False, margin=dict(l=10, r=100, t=30, b=10),
+                                   title=f"{full_symbol} — zoomed to the current band (0° anchor = {open_ref:.2f})")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.caption("No candle data available to draw the chart right now.")
+
+            # Smart-money zones: live order block + golden pocket, as requested
+            st.markdown("---")
+            st.subheader("🧠 Smart Money Zones")
+            zc1, zc2 = st.columns(2)
+            with zc1:
+                st.markdown("**📦 Live Order Block**")
+                ob = detect_order_block(chart_df)
+                price = quant['price']
+                if ob:
+                    if ob.get("bullish"):
+                        lo_ob, hi_ob = ob["bullish"]["low"], ob["bullish"]["high"]
+                        inside = lo_ob <= price <= hi_ob
+                        st.success(f"🟩 Bullish OB: {lo_ob:.2f} – {hi_ob:.2f}" + (" — price is inside it now" if inside else ""))
+                    if ob.get("bearish"):
+                        lo_ob, hi_ob = ob["bearish"]["low"], ob["bearish"]["high"]
+                        inside = lo_ob <= price <= hi_ob
+                        st.error(f"🟥 Bearish OB: {lo_ob:.2f} – {hi_ob:.2f}" + (" — price is inside it now" if inside else ""))
+                else:
+                    st.caption("No clear recent order block detected in this window.")
+            with zc2:
+                st.markdown("**🌀 Golden Pocket (61.8%–65% Fib)**")
+                gp = detect_golden_pocket(chart_df)
+                if gp:
+                    price = quant['price']
+                    inside = gp["gp_low"] <= price <= gp["gp_high"]
+                    direction = "pullback in an uptrend" if gp["uptrend"] else "bounce in a downtrend"
+                    msg = f"Zone: {gp['gp_low']:.2f} – {gp['gp_high']:.2f} ({direction})"
+                    if inside:
+                        st.success(f"✅ Price IS inside the golden pocket. {msg}")
+                    else:
+                        st.info(f"Price is outside it right now. {msg}")
+                else:
+                    st.caption("Not enough recent data to compute a golden pocket.")
+
+            st.markdown("---")
+            st.markdown("### 🎯 Traditional Pivot Levels")
+            pivot_rows = []
+            for level in ["4", "3", "2", "1"]:
+                r_raw = quant.get(f'r{level}')
+                s_raw = quant.get(f's{level}')
+                try:
+                    r_val = float(r_raw) if r_raw is not None else 0.0
+                except (ValueError, TypeError):
+                    r_val = 0.0
+                try:
+                    s_val = float(s_raw) if s_raw is not None else 0.0
+                except (ValueError, TypeError):
+                    s_val = 0.0
+                pivot_rows.append({"Resistance": r_val, "Support": s_val})
+            levels_df = pd.DataFrame(pivot_rows, index=["Level 4", "Level 3", "Level 2", "Level 1"])
+            st.dataframe(levels_df, use_container_width=True)
+
+        # ---------- AI SUGGESTIONS (right, beside live analysis) ----------
+        with col_ai:
+            st.subheader("💡 AI Trading Suggestions")
+            news_text = "\n".join([n['title'] for n in news_list[:5]]) if news_list else "No news"
+            if st.button("🚀 Generate AI Suggestions", use_container_width=True):
+                with st.spinner("AI analyzing..."):
+                    st.session_state["last_ai_suggestion"] = get_groq_suggestions(full_symbol, quant, news_text)
+            last = st.session_state.get("last_ai_suggestion")
+            if last:
+                if last.startswith("⚠️"):
+                    st.error(last)
+                else:
+                    st.markdown(last)
+            else:
+                st.caption("Click the button to get an INTRADAY + SWING read on this ticker.")
+
+        # ---------- NEWS (full width, stock-specific) ----------
         st.markdown("---")
-        st.subheader("📰 Global News Feed")
-        filtered_news = [n for n in news_list if (n["impact"] > 0 and "🟢 Bullish" in sentiment_filter) or (n["impact"] < 0 and "🔴 Bearish" in sentiment_filter) or (n["impact"] == 0 and "🟡 Neutral" in sentiment_filter)]
-        if filtered_news:
-            for n in filtered_news[:15]:
+        st.subheader(f"📰 News on {full_symbol}")
+
+        sentiment_ok = lambda n: (n["impact"] > 0 and "🟢 Bullish" in sentiment_filter) or (n["impact"] < 0 and "🔴 Bearish" in sentiment_filter) or (n["impact"] == 0 and "🟡 Neutral" in sentiment_filter)
+
+        keywords = get_relevance_keywords(search_ticker, stock_info)
+        stock_news = [n for n in filter_relevant_news(news_list, keywords, max_items=8) if sentiment_ok(n)]
+
+        used_fallback = False
+        if not stock_news:
+            used_fallback = True
+            stock_news = [n for n in news_list if sentiment_ok(n)][:5]
+
+        if used_fallback:
+            st.info(f"No headlines in the current feeds specifically mention {full_symbol} right now — showing top general market news instead.")
+
+        if stock_news:
+            for n in stock_news[:8]:
                 badge = "🟢" if n['impact'] > 0 else ("🔴" if n['impact'] < 0 else "🟡")
-                st.markdown(f"{badge} **[{n['source']}]** {n['title']}")
-                st.caption(f"📅 {n['time']} | [🔗 Link]({n['link']})")
-                st.markdown("---")
+                title_safe = html_module.escape(n['title'])
+                summary_safe = html_module.escape(n.get('summary', ''))
+                st.markdown(f"""
+<div class="news-card">
+  <div class="news-title">{badge} {title_safe}</div>
+  <div class="news-summary">{summary_safe}</div>
+  <div class="news-meta">📌 {html_module.escape(n['source'])} · 📅 {html_module.escape(n['time'])} · <a href="{n['link']}" target="_blank">Read full story →</a></div>
+</div>
+""", unsafe_allow_html=True)
         else:
-            st.info("No news matching your filters")
-        
-        st.markdown("---")
-        st.subheader("💡 AI Trading Suggestions")
-        news_text = "\n".join([n['title'] for n in news_list[:5]]) if news_list else "No news"
-        if st.button("🚀 Generate AI Suggestions"):
-            with st.spinner("AI analyzing..."):
-                suggestions = get_groq_suggestions(full_symbol, quant, news_text)
-                st.markdown(suggestions)
+            st.info("No news matching your current sentiment filters.")
 
 
 # ================== TAB 2: AI CHAT ==================
@@ -471,14 +807,7 @@ with tab2:
     st.header("💬 AI Chat Assistant")
     st.markdown("**Ask about:** Stock analysis, levels, news, strategy, market outlook")
     
-    model = st.selectbox("Choose Model", [
-        "Groq (Llama 3.1 8B)",
-        "Groq (Gemma 2 9B)", 
-        "Groq (Mixtral 8x7B)",
-        "Groq (Llama 3.3 70B)",
-        "Gemini 1.5 Flash",
-        "Gemini 1.5 Pro"
-    ])
+    model = st.selectbox("Choose Model", list(GROQ_MODEL_MAP.keys()) + list(GEMINI_MODEL_MAP.keys()))
     
     if "chat_context" not in st.session_state:
         st.session_state.chat_context = ""
@@ -500,15 +829,11 @@ with tab2:
                 st.markdown(prompt)
             with st.chat_message("assistant"):
                 with st.spinner(f"AI thinking... ({model})"):
-                    try:
-                        response = get_chat_response(prompt, st.session_state.chat_context, model)
-                        if response and response != "Error" and len(response) > 10:
-                            st.markdown(response)
-                        else:
-                            st.error(f"❌ AI Error - Response: {response}")
-                    except Exception as e:
-                        st.error(f"❌ Error: {str(e)}")
-                        response = "Error occurred"
+                    response = get_chat_response(prompt, st.session_state.chat_context, model)
+                    if response and not response.startswith("⚠️"):
+                        st.markdown(response)
+                    else:
+                        st.error(response or "❌ AI Error - Try a different model or check your API keys")
                 st.session_state.chat_messages.append({"role": "assistant", "content": response})
         
         if st.button("🗑️ Clear Chat"):
