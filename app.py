@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 import email.utils
 from datetime import datetime, timezone, timedelta
 from groq import Groq
-from google import genai as genai
+from google import genai as google_genai
 import requests
 
 
