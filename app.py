@@ -519,16 +519,16 @@ def build_quant_summary(yf_symbol: str, ref_price: float):
         anchor_price = ref_price or last_close
         anchor_sqrt = math.sqrt(abs(anchor_price)) if anchor_price else 0.0
         r225 = (anchor_sqrt + 22.5 / 180.0) ** 2
-r450 = (anchor_sqrt + 45.0 / 180.0) ** 2
-r675 = (anchor_sqrt + 67.5 / 180.0) ** 2
-r900 = (anchor_sqrt + 90.0 / 180.0) ** 2
-r180 = (anchor_sqrt + 180.0 / 180.0) ** 2
+        r450 = (anchor_sqrt + 45.0 / 180.0) ** 2
+        r675 = (anchor_sqrt + 67.5 / 180.0) ** 2
+        r900 = (anchor_sqrt + 90.0 / 180.0) ** 2
+        r180 = (anchor_sqrt + 180.0 / 180.0) ** 2
 
-s225 = max(0.01, (anchor_sqrt - 22.5 / 180.0) ** 2)
-s450 = max(0.01, (anchor_sqrt - 45.0 / 180.0) ** 2)
-s675 = max(0.01, (anchor_sqrt - 67.5 / 180.0) ** 2)
-s900 = max(0.01, (anchor_sqrt - 90.0 / 180.0) ** 2)
-s180 = max(0.01, (anchor_sqrt - 180.0 / 180.0) ** 2)
+        s225 = max(0.01, (anchor_sqrt - 22.5 / 180.0) ** 2)
+        s450 = max(0.01, (anchor_sqrt - 45.0 / 180.0) ** 2)
+        s675 = max(0.01, (anchor_sqrt - 67.5 / 180.0) ** 2)
+        s900 = max(0.01, (anchor_sqrt - 90.0 / 180.0) ** 2)
+        s180 = max(0.01, (anchor_sqrt - 180.0 / 180.0) ** 2)
 
         closes = daily["Close"]
         fast_ema = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
@@ -752,95 +752,111 @@ with main_col:
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown(
-    "<div class='card-header'>Square-of-9 Gann Degree Ladder</div>",
-    unsafe_allow_html=True,
-)
-        ref_note = levels.get('_ref_time', 'session') if levels else 'session'
-        ref_px = levels.get('_ref_close', 0) if levels else 0
-        st.markdown(
-            f"<div class='card-sub'>0° = first 15-min close ({format_price(ref_px)}) · levels FIXED until market close · educational references only</div>",
-            unsafe_allow_html=True
+            "<div class='card-header'>Square-of-9 Gann Degree Ladder</div>",
+            unsafe_allow_html=True,
         )
-        if levels and levels.get("_type") == "gann_degree":
+
+        ref_note = levels.get("_ref_time", "session") if levels else "session"
+        ref_px = levels.get("_ref_close", 0) if levels else 0
+
+        st.markdown(
+            f"<div class='card-sub'>"
+            f"0° = first 15-minute closing price ({format_price(ref_px)}) · "
+            f"R/S levels use √price ± degree/180 · fixed for the session"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        if levels and levels.get("_type") == "gann_sq9":
             gann_resistance_degrees = [180.0, 90.0, 67.5, 45.0, 22.5]
 
-for degree in gann_resistance_degrees:
-    suffix = str(degree).rstrip("0").rstrip(".")
-    val = levels.get(f"R{suffix}", 0.0)
-    pct = ((val - price) / price * 100) if price else 0.0
+            for degree in gann_resistance_degrees:
+                suffix = str(degree).rstrip("0").rstrip(".")
+                val = levels.get(f"R{suffix}", 0.0)
+                pct = ((val - price) / price * 100) if price else 0.0
 
-    st.markdown(
-        f"""
-        <div class='level-row level-resistance'>
-            <span>
-                <b style='color:#f87171'>{degree:g}° R</b>
-                &nbsp; {format_price(val)}
-                &nbsp;
-                <span style='color:#64748b;font-size:0.75rem'>
-                    above 0° anchor
-                </span>
-            </span>
-            <span class='down'>{format_percent(pct)}</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-                pct = ((val - price) / price * 100) if price else 0
                 st.markdown(
-                    f"<div class='level-row level-resistance'>"
-                    f"<span><b style='color:#f87171'>{deg}°</b> &nbsp; {format_price(val)} &nbsp; "
-                    f"<span style='color:#64748b;font-size:0.75rem'>above 0°</span></span>"
-                    f"<span class='down'>{format_percent(pct)}</span></div>",
-                    unsafe_allow_html=True
+                    f"""
+                    <div class='level-row level-resistance'>
+                        <span>
+                            <b style='color:#f87171'>{degree:g}° R</b>
+                            &nbsp; {format_price(val)}
+                            &nbsp;
+                            <span style='color:#64748b;font-size:0.75rem'>
+                                above 0° anchor
+                            </span>
+                        </span>
+                        <span class='down'>{format_percent(pct)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
+
             st.markdown(
-                f"<div style='text-align:center;padding:12px;background:rgba(251,191,36,0.14);border-radius:10px;margin:8px 0;border:1px solid rgba(251,191,36,0.4)'>"
-                f"<div class='amber' style='font-size:1.15rem;font-weight:700;'><b>0°</b> &nbsp; Reference &nbsp; {format_price(ref_px)}</div>"
-                f"<div style='font-size:1.15rem;font-weight:700;color:#f8fafc;margin-top:6px;'>Current price: {format_price(price)}</div></div>",
-                unsafe_allow_html=True
+                f"<div style='text-align:center;padding:12px;background:rgba(251,191,36,0.14);"
+                f"border-radius:10px;margin:8px 0;border:1px solid rgba(251,191,36,0.4)'>"
+                f"<div class='amber' style='font-size:1.15rem;font-weight:700;'>"
+                f"<b>0°</b> &nbsp; Reference &nbsp; {format_price(ref_px)}</div>"
+                f"<div style='font-size:1.15rem;font-weight:700;color:#f8fafc;margin-top:6px;'>"
+                f"Current price: {format_price(price)}</div></div>",
+                unsafe_allow_html=True,
             )
+
             gann_support_degrees = [22.5, 45.0, 67.5, 90.0, 180.0]
 
-for degree in gann_support_degrees:
-    suffix = str(degree).rstrip("0").rstrip(".")
-    val = levels.get(f"S{suffix}", 0.0)
-    pct = ((val - price) / price * 100) if price else 0.0
+            for degree in gann_support_degrees:
+                suffix = str(degree).rstrip("0").rstrip(".")
+                val = levels.get(f"S{suffix}", 0.0)
+                pct = ((val - price) / price * 100) if price else 0.0
 
-    st.markdown(
-        f"""
-        <div class='level-row level-support'>
-            <span>
-                <b style='color:#34d399'>{degree:g}° S</b>
-                &nbsp; {format_price(val)}
-                &nbsp;
-                <span style='color:#64748b;font-size:0.75rem'>
-                    below 0° anchor
-                </span>
-            </span>
-            <span class='up'>{format_percent(pct)}</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-                pct = ((val - price) / price * 100) if price else 0
                 st.markdown(
-                    f"<div class='level-row level-support'>"
-                    f"<span><b style='color:#34d399'>{deg}°</b> &nbsp; {format_price(val)} &nbsp; "
-                    f"<span style='color:#64748b;font-size:0.75rem'>below 0°</span></span>"
-                    f"<span class='up'>{format_percent(pct)}</span></div>",
-                    unsafe_allow_html=True
+                    f"""
+                    <div class='level-row level-support'>
+                        <span>
+                            <b style='color:#34d399'>{degree:g}° S</b>
+                            &nbsp; {format_price(val)}
+                            &nbsp;
+                            <span style='color:#64748b;font-size:0.75rem'>
+                                below 0° anchor
+                            </span>
+                        </span>
+                        <span class='up'>{format_percent(pct)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-            st.caption("Degree levels are potential price references only — not guaranteed reversals. Always define entry, stop, target and risk before trading.")
+
+            st.caption(
+                "Degree levels are potential price references only — not guaranteed reversals. "
+                "Always define entry, stop, target and risk before trading."
+            )
         elif levels:
             for key in ["R5", "R4", "R3", "R2", "R1"]:
                 val = levels.get(key, 0)
                 pct = ((val - price) / price * 100) if price else 0
-                st.markdown(f"<div class='level-row level-resistance'><span><b style='color:#f87171'>{key}</b> &nbsp; {format_price(val)}</span><span class='down'>{format_percent(pct)}</span></div>", unsafe_allow_html=True)
-            st.markdown(f"<div style='text-align:center;padding:8px;background:rgba(251,191,36,0.12);border-radius:8px;margin:6px 0;border:1px solid rgba(251,191,36,0.3)'><span class='amber'>● Current: {format_price(price)}</span></div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='level-row level-resistance'>"
+                    f"<span><b style='color:#f87171'>{key}</b> &nbsp; {format_price(val)}</span>"
+                    f"<span class='down'>{format_percent(pct)}</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown(
+                f"<div style='text-align:center;padding:8px;background:rgba(251,191,36,0.12);"
+                f"border-radius:8px;margin:6px 0;border:1px solid rgba(251,191,36,0.3)'>"
+                f"<span class='amber'>● Current: {format_price(price)}</span></div>",
+                unsafe_allow_html=True,
+            )
+
             for key in ["S1", "S2", "S3", "S4", "S5"]:
                 val = levels.get(key, 0)
                 pct = ((val - price) / price * 100) if price else 0
-                st.markdown(f"<div class='level-row level-support'><span><b style='color:#34d399'>{key}</b> &nbsp; {format_price(val)}</span><span class='up'>{format_percent(pct)}</span></div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='level-row level-support'>"
+                    f"<span><b style='color:#34d399'>{key}</b> &nbsp; {format_price(val)}</span>"
+                    f"<span class='up'>{format_percent(pct)}</span></div>",
+                    unsafe_allow_html=True,
+                )
         else:
             st.info("Levels unavailable.")
         st.markdown("</div>", unsafe_allow_html=True)
