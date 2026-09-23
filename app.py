@@ -576,9 +576,9 @@ with main_col:
                 )
             # 0° reference
             st.markdown(
-                f"<div style='text-align:center;padding:10px;background:rgba(251,191,36,0.14);border-radius:10px;margin:8px 0;border:1px solid rgba(251,191,36,0.4)'>"
-                f"<span class='amber'><b>0°</b> &nbsp; Reference &nbsp; {format_price(ref_px)}</span>"
-                f"<div style='font-size:0.75rem;color:#94a3b8;margin-top:2px'>Current price: {format_price(price)}</div></div>",
+                f"<div style='text-align:center;padding:12px;background:rgba(251,191,36,0.14);border-radius:10px;margin:8px 0;border:1px solid rgba(251,191,36,0.4)'>"
+                f"<div class='amber' style='font-size:1.15rem;font-weight:700;'><b>0°</b> &nbsp; Reference &nbsp; {format_price(ref_px)}</div>"
+                f"<div style='font-size:1.15rem;font-weight:700;color:#f8fafc;margin-top:6px;'>Current price: {format_price(price)}</div></div>",
                 unsafe_allow_html=True
             )
             down_degrees = [45, 90, 135, 180, 225, 270, 315, 360]
@@ -750,119 +750,215 @@ with main_col:
     elif st.session_state.page == "Heatmap":
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("<div class='card-header'>Market Heatmap</div>", unsafe_allow_html=True)
-        st.markdown("<div class='card-sub'>Sector performance at a glance — click any ticker to analyze</div>", unsafe_allow_html=True)
+        st.markdown("<div class='card-sub'>Auto-follows selected market · click any ticker to analyze</div>", unsafe_allow_html=True)
 
-        # Sector chips exactly like screenshot
-        sector_chips = [
-            "All", "Banking", "IT", "Energy", "Auto", "FMCG", "Pharma", "Metal",
-            "US Tech", "US Banking", "US Auto", "Crypto", "Commodities", "Global"
-        ]
-        chip = st.radio("sectors", sector_chips, horizontal=True, label_visibility="collapsed", key="heat_chip")
+        # Detect category of currently selected symbol
+        selected_cat = "india"
+        for m in MARKET_ITEMS:
+            if m["yf"] == st.session_state.selected_yf or m["symbol"] == st.session_state.selected_symbol:
+                selected_cat = m["category"]
+                break
+        else:
+            selected_cat = st.session_state.market_cat
 
-        # Map chips → symbols (real universe used in original UI)
-        chip_map = {
-            "All": [m for m in MARKET_ITEMS],
-            "Banking": [m for m in MARKET_ITEMS if m["symbol"] in ["HDFCBANK", "ICICIBANK", "SBIN", "JPM"]],
-            "IT": [m for m in MARKET_ITEMS if m["symbol"] in ["TCS", "INFY", "AAPL", "MSFT", "GOOGL", "NVDA", "META"]],
-            "Energy": [m for m in MARKET_ITEMS if m["symbol"] in ["RELIANCE", "CL", "NG"]],
-            "Auto": [m for m in MARKET_ITEMS if m["symbol"] in ["TATAMOTORS", "TSLA"]],
-            "FMCG": [m for m in MARKET_ITEMS if m["symbol"] in ["ITC"]],
-            "Pharma": [m for m in MARKET_ITEMS if m["symbol"] in ["SUNPHARMA"]],
-            "Metal": [m for m in MARKET_ITEMS if m["symbol"] in ["TATASTEEL", "HG"]],
-            "US Tech": [m for m in MARKET_ITEMS if m["symbol"] in ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"]],
-            "US Banking": [m for m in MARKET_ITEMS if m["symbol"] in ["JPM"]],
-            "US Auto": [m for m in MARKET_ITEMS if m["symbol"] in ["TSLA"]],
-            "Crypto": [m for m in MARKET_ITEMS if m["category"] == "crypto"],
-            "Commodities": [m for m in MARKET_ITEMS if m["category"] == "commodities"],
-            "Global": [m for m in MARKET_ITEMS if m["category"] in ["forex", "indices"]],
+        # Map category → default chip
+        cat_to_chip = {
+            "india": "India",
+            "us": "US",
+            "crypto": "Crypto",
+            "commodities": "Commodities",
+            "forex": "Global",
+            "indices": "Global",
         }
-        pool = chip_map.get(chip, MARKET_ITEMS)
-        if not pool:
-            pool = MARKET_ITEMS
+        default_chip = cat_to_chip.get(selected_cat, "All")
 
-        # Fetch live data — sort by absolute % move so real heat rises to top
+        # Top market chips (country/section)
+        market_chips = ["All", "India", "US", "Crypto", "Commodities", "Global"]
+        # Pre-select based on current stock
+        try:
+            m_idx = market_chips.index(default_chip)
+        except ValueError:
+            m_idx = 0
+        market_sel = st.radio("Market section", market_chips, horizontal=True, index=m_idx, label_visibility="collapsed", key="heat_market")
+
+        # Sector chips under that market
+        sector_by_market = {
+            "All": ["All", "Banking", "IT", "Energy", "Auto", "FMCG", "Pharma", "Metal", "US Tech", "Crypto", "Commodities"],
+            "India": ["All", "Banking", "IT", "Energy", "Auto", "FMCG", "Pharma", "Metal"],
+            "US": ["All", "US Tech", "US Banking", "US Auto"],
+            "Crypto": ["All", "Crypto"],
+            "Commodities": ["All", "Commodities"],
+            "Global": ["All", "Global"],
+        }
+        sec_chips = sector_by_market.get(market_sel, ["All"])
+        sec_sel = st.radio("Sector", sec_chips, horizontal=True, label_visibility="collapsed", key="heat_sec")
+
+        # Build symbol pool
+        cat_map = {"India": "india", "US": "us", "Crypto": "crypto", "Commodities": "commodities", "Global": None}
+        if market_sel == "All":
+            pool = list(MARKET_ITEMS)
+        elif market_sel == "Global":
+            pool = [m for m in MARKET_ITEMS if m["category"] in ("forex", "indices")]
+        else:
+            pool = [m for m in MARKET_ITEMS if m["category"] == cat_map.get(market_sel, "india")]
+
+        chip_filter = {
+            "Banking": ["HDFCBANK", "ICICIBANK", "SBIN", "JPM"],
+            "IT": ["TCS", "INFY"],
+            "Energy": ["RELIANCE", "CL", "NG"],
+            "Auto": ["TATAMOTORS", "TSLA"],
+            "FMCG": ["ITC"],
+            "Pharma": ["SUNPHARMA"],
+            "Metal": ["TATASTEEL", "HG"],
+            "US Tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"],
+            "US Banking": ["JPM"],
+            "US Auto": ["TSLA"],
+            "Crypto": ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE"],
+            "Commodities": ["GC", "SI", "CL", "NG", "HG"],
+            "Global": None,
+        }
+        if sec_sel != "All" and sec_sel in chip_filter and chip_filter[sec_sel]:
+            allow = set(chip_filter[sec_sel])
+            filtered = [m for m in pool if m["symbol"] in allow]
+            if filtered:
+                pool = filtered
+
+        # Live data sorted by real heat
         rows = []
         for item in pool:
             d = fetch_stock_data(item["yf"])
             chg = float(d.get("changePercent") or 0)
-            rows.append({
-                "symbol": item["symbol"],
-                "yf": item["yf"],
-                "price": float(d.get("currentPrice") or 0),
-                "chg": chg,
-            })
+            rows.append({"symbol": item["symbol"], "yf": item["yf"], "price": float(d.get("currentPrice") or 0), "chg": chg})
         rows.sort(key=lambda x: abs(x["chg"]), reverse=True)
 
-        # Render tiles like screenshot (5 per row)
-        cols = st.columns(5)
-        for i, r in enumerate(rows):
-            chg = r["chg"]
-            is_up = chg >= 0
-            # Tile background + text colors matching screenshot
-            if is_up:
-                bg = "rgba(16,185,129,0.16)"
-                border = "rgba(16,185,129,0.35)"
-                pct_color = "#34d399"
-                arrow = "↗"
-            else:
-                bg = "rgba(239,68,68,0.14)"
-                border = "rgba(239,68,68,0.32)"
-                pct_color = "#f87171"
-                arrow = "↘"
-
-            with cols[i % 5]:
-                # Whole tile is a button-like card
-                tile_html = f"""
-                <div style="
-                    background:{bg};
-                    border:1px solid {border};
-                    border-radius:12px;
-                    padding:12px 10px;
-                    margin-bottom:8px;
-                    min-height:78px;
-                    position:relative;
-                ">
-                    <div style="display:flex;justify-content:space-between;align-items:center;">
-                        <span style="font-weight:700;font-size:0.88rem;color:#f1f5f9;">{r['symbol']}</span>
-                        <span style="color:{pct_color};font-size:0.9rem;">{arrow}</span>
+        if not rows:
+            st.info("No symbols for this filter.")
+        else:
+            cols = st.columns(5)
+            for i, r in enumerate(rows):
+                chg = r["chg"]
+                is_up = chg >= 0
+                bg = "rgba(16,185,129,0.16)" if is_up else "rgba(239,68,68,0.14)"
+                border = "rgba(16,185,129,0.35)" if is_up else "rgba(239,68,68,0.32)"
+                pct_color = "#34d399" if is_up else "#f87171"
+                arrow = "↗" if is_up else "↘"
+                with cols[i % 5]:
+                    st.markdown(f"""
+                    <div style="background:{bg};border:1px solid {border};border-radius:12px;padding:12px 10px;margin-bottom:8px;min-height:78px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <span style="font-weight:700;font-size:0.88rem;color:#f1f5f9;">{r['symbol']}</span>
+                            <span style="color:{pct_color};font-size:0.9rem;">{arrow}</span>
+                        </div>
+                        <div style="font-size:1.05rem;font-weight:600;color:#f8fafc;margin-top:4px;">{format_price(r['price'])}</div>
+                        <div style="color:{pct_color};font-weight:600;font-size:0.85rem;margin-top:2px;">{format_percent(chg)}</div>
                     </div>
-                    <div style="font-size:1.05rem;font-weight:600;color:#f8fafc;margin-top:4px;font-variant-numeric:tabular-nums;">
-                        {format_price(r['price'])}
-                    </div>
-                    <div style="color:{pct_color};font-weight:600;font-size:0.85rem;margin-top:2px;">
-                        {format_percent(chg)}
-                    </div>
-                </div>
-                """
-                st.markdown(tile_html, unsafe_allow_html=True)
-                if st.button("Analyze", key=f"hm_{r['symbol']}_{i}", use_container_width=True):
-                    st.session_state.selected_symbol = r["symbol"]
-                    st.session_state.selected_yf = r["yf"]
-                    st.session_state.page = "Dashboard"
-                    st.rerun()
-
+                    """, unsafe_allow_html=True)
+                    if st.button("Analyze", key=f"hm_{r['symbol']}_{i}", use_container_width=True):
+                        st.session_state.selected_symbol = r["symbol"]
+                        st.session_state.selected_yf = r["yf"]
+                        st.session_state.page = "Dashboard"
+                        st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
     elif st.session_state.page == "History":
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown(f"<div class='card-header'>Historical Data — {st.session_state.selected_symbol}</div>", unsafe_allow_html=True)
-        st.markdown("<div class='card-sub'>Last 30 sessions + swing levels</div>", unsafe_allow_html=True)
+        st.markdown("<div class='card-sub'>Previous 2 trading days · price action, volume, trend & momentum</div>", unsafe_allow_html=True)
+
         hist = fetch_history(st.session_state.selected_yf)
-        if hist is not None and not hist.empty:
-            colors = ["#34d399" if hist["Close"].iloc[i] >= hist["Open"].iloc[i] else "#f87171" for i in range(len(hist))]
-            fig = go.Figure(go.Bar(x=hist.index, y=hist["Close"], marker_color=colors))
-            fig.update_layout(paper_bgcolor="#0F172A", plot_bgcolor="#0F172A", height=260,
+        if hist is not None and not hist.empty and len(hist) >= 2:
+            day2 = hist.iloc[-1]  # most recent
+            day1 = hist.iloc[-2]  # previous day
+
+            d1_o, d1_h, d1_l, d1_c = float(day1["Open"]), float(day1["High"]), float(day1["Low"]), float(day1["Close"])
+            d2_o, d2_h, d2_l, d2_c = float(day2["Open"]), float(day2["High"]), float(day2["Low"]), float(day2["Close"])
+            d1_v = float(day1.get("Volume", 0) or 0)
+            d2_v = float(day2.get("Volume", 0) or 0)
+            d1_date = hist.index[-2].strftime("%b %d") if hasattr(hist.index[-2], "strftime") else str(hist.index[-2])
+            d2_date = hist.index[-1].strftime("%b %d") if hasattr(hist.index[-1], "strftime") else str(hist.index[-1])
+
+            # Mini chart last ~10 days
+            tail = hist.tail(12)
+            colors = ["#34d399" if tail["Close"].iloc[i] >= tail["Open"].iloc[i] else "#f87171" for i in range(len(tail))]
+            fig = go.Figure(go.Bar(x=tail.index, y=tail["Close"], marker_color=colors))
+            fig.update_layout(paper_bgcolor="#0F172A", plot_bgcolor="#0F172A", height=220,
                 margin=dict(l=0, r=0, t=10, b=0), showlegend=False, font=dict(color="#94a3b8"),
                 xaxis=dict(gridcolor="rgba(51,65,85,0.3)"), yaxis=dict(gridcolor="rgba(51,65,85,0.3)", side="right"))
             st.plotly_chart(fig, use_container_width=True)
+
+            # Two-day comparison table
+            st.markdown("##### 📊 Price Action and Levels")
             c1, c2 = st.columns(2)
-            c1.markdown(f"<div class='level-row level-resistance'><b>Swing Resistance</b> {format_price(float(hist['High'].max()))}</div>", unsafe_allow_html=True)
-            c2.markdown(f"<div class='level-row level-support'><b>Swing Support</b> {format_price(float(hist['Low'].min()))}</div>", unsafe_allow_html=True)
-            show = hist[["Open", "High", "Low", "Close"]].tail(15).iloc[::-1]
-            show.index = show.index.strftime("%b %d")
-            st.dataframe(show.style.format("{:.2f}"), use_container_width=True)
+            with c1:
+                st.markdown(f"**Day 1 — {d1_date}**")
+                st.write(f"Open: `{format_price(d1_o)}` · High: `{format_price(d1_h)}`")
+                st.write(f"Low: `{format_price(d1_l)}` · Close: `{format_price(d1_c)}`")
+                rng1 = d1_h - d1_l
+                pos1 = ((d1_c - d1_l) / rng1 * 100) if rng1 > 0 else 50
+                st.caption(f"Close position in range: {pos1:.0f}% from low")
+            with c2:
+                st.markdown(f"**Day 2 — {d2_date}**")
+                st.write(f"Open: `{format_price(d2_o)}` · High: `{format_price(d2_h)}`")
+                st.write(f"Low: `{format_price(d2_l)}` · Close: `{format_price(d2_c)}`")
+                rng2 = d2_h - d2_l
+                pos2 = ((d2_c - d2_l) / rng2 * 100) if rng2 > 0 else 50
+                st.caption(f"Close position in range: {pos2:.0f}% from low")
+
+            broke_high = d2_h > d1_h
+            broke_low = d2_l < d1_l
+            st.write(
+                f"- Day 2 **{'broke' if broke_high else 'did not break'}** Day 1 high ({format_price(d1_h)})."
+            )
+            st.write(
+                f"- Day 2 **{'broke' if broke_low else 'did not break'}** Day 1 low ({format_price(d1_l)})."
+            )
+            st.write(
+                f"- Day 2 closed **{'near the high' if pos2 >= 70 else ('near the low' if pos2 <= 30 else 'mid-range')}** of its daily range."
+            )
+
+            st.markdown("##### 📈 Volume Analysis")
+            vol_chg = ((d2_v - d1_v) / d1_v * 100) if d1_v > 0 else 0
+            st.write(f"- Day 1 volume: `{format_volume(d1_v)}` · Day 2 volume: `{format_volume(d2_v)}` ({format_percent(vol_chg)})")
+            up_day = d2_c >= d2_o
+            if up_day and d2_v > d1_v:
+                st.write("- Higher volume on an **up** day → stronger buyer interest.")
+            elif (not up_day) and d2_v > d1_v:
+                st.write("- Higher volume on a **down** day → heavier selling pressure.")
+            else:
+                st.write("- Volume did not expand with the move → conviction is mixed.")
+
+            st.markdown("##### 💡 Trend and Momentum")
+            net_pct = ((d2_c - d1_c) / d1_c * 100) if d1_c else 0
+            st.write(f"- Net change (Day1 close → Day2 close): **{format_percent(net_pct)}**")
+            gap = d2_o - d1_c
+            gap_pct = (gap / d1_c * 100) if d1_c else 0
+            if abs(gap_pct) >= 0.3:
+                st.write(f"- Gap between Day1 close and Day2 open: **{format_percent(gap_pct)}** ({'gap up' if gap > 0 else 'gap down'}).")
+            else:
+                st.write("- No significant gap between Day1 close and Day2 open.")
+
+            # Simple MA slope on available history
+            closes = hist["Close"].tail(9)
+            if len(closes) >= 5:
+                ma5 = closes.tail(5).mean()
+                ma5_prev = closes.tail(6).head(5).mean() if len(closes) >= 6 else ma5
+                slope = "up" if ma5 > ma5_prev else "down"
+                st.write(f"- 5-period MA is sloping **{slope}** (MA5 ≈ {format_price(float(ma5))}).")
+            if len(closes) >= 9:
+                ma9 = closes.tail(9).mean()
+                st.write(f"- 9-period MA ≈ {format_price(float(ma9))}.")
+
+            # Swing levels
+            st.markdown("##### Swing levels (lookback)")
+            s1, s2 = st.columns(2)
+            s1.markdown(f"<div class='level-row level-resistance'><b>Swing High</b> {format_price(float(hist['High'].tail(10).max()))}</div>", unsafe_allow_html=True)
+            s2.markdown(f"<div class='level-row level-support'><b>Swing Low</b> {format_price(float(hist['Low'].tail(10).min()))}</div>", unsafe_allow_html=True)
+
+            show = hist[["Open", "High", "Low", "Close", "Volume"]].tail(10).iloc[::-1]
+            show.index = [i.strftime("%b %d") if hasattr(i, "strftime") else str(i) for i in show.index]
+            st.dataframe(show.style.format({"Open": "{:.2f}", "High": "{:.2f}", "Low": "{:.2f}", "Close": "{:.2f}", "Volume": "{:,.0f}"}), use_container_width=True)
         else:
-            st.info("No historical data.")
+            st.warning("Not enough historical data (need at least 2 daily bars). Try another symbol or wait for data.")
         st.markdown("</div>", unsafe_allow_html=True)
 
 with side_col:
