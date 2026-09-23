@@ -271,6 +271,7 @@ def fetch_history(yf_symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def generate_levels(high: float, low: float, close: float) -> Dict:
+    """Legacy classic pivot (fallback only)."""
     if high <= 0 or low <= 0 or close <= 0:
         return {}
     pivot = (high + low + close) / 3.0
@@ -282,6 +283,75 @@ def generate_levels(high: float, low: float, close: float) -> Dict:
         "S1": 2 * pivot - high, "S2": pivot - range_, "S3": low - 2 * (high - pivot),
         "S4": pivot - 2 * range_, "S5": pivot - 3 * range_,
     }
+
+def gann_degree_levels(ref_price: float) -> Dict:
+    """
+    Degree-Level Framework (Gann-style).
+    0° = reference price (first 15-min closing candle of the session).
+    Levels are mathematical price references only — not guaranteed reversals.
+    Uses Square-of-9 style mapping on sqrt(price).
+    """
+    if ref_price is None or ref_price <= 0:
+        return {}
+    import math
+    root = math.sqrt(ref_price)
+    # Full circle: 360° ≈ +2.0 on sqrt scale is common in educational scripts;
+    # 45° step = 0.25 on sqrt scale → clean 0/45/90/.../360 grid
+    step = 0.25  # 45 degrees
+    degrees = [0, 45, 90, 135, 180, 225, 270, 315, 360]
+    levels = {"_ref_close": ref_price, "_type": "gann_degree"}
+    for i, deg in enumerate(degrees):
+        up = (root + step * (deg / 45.0)) ** 2
+        down = (root - step * (deg / 45.0)) ** 2
+        levels[f"U{deg}"] = up   # above reference
+        levels[f"D{deg}"] = max(0.01, down)  # below reference
+    levels["0"] = ref_price
+    return levels
+
+@st.cache_data(ttl=300)
+def get_session_fixed_levels(yf_symbol: str) -> Dict:
+    """
+    0° reference = first 15-minute CLOSING price of the session.
+    Degree levels (45/90/135/180/225/270/315/360) are FIXED from that price
+    and do not move when live price changes. Reset next session.
+    """
+    try:
+        t = yf.Ticker(yf_symbol)
+        df = t.history(period="5d", interval="15m")
+        if df is None or df.empty:
+            daily = t.history(period="10d", interval="1d")
+            if daily is None or daily.empty:
+                return {}
+            last = daily.iloc[-1]
+            ref = float(last["Close"])
+            levels = gann_degree_levels(ref)
+            levels["_ref"] = "daily_fallback"
+            levels["_ref_time"] = str(daily.index[-1])
+            # also keep classic for suggestion engine
+            classic = generate_levels(float(last["High"]), float(last["Low"]), ref)
+            levels.update({k: v for k, v in classic.items() if k.startswith(("R", "S", "pivot"))})
+            return levels
+
+        df = df.copy()
+        df["date"] = df.index.date
+        last_day = df["date"].iloc[-1]
+        day_bars = df[df["date"] == last_day]
+        if day_bars.empty:
+            day_bars = df.tail(26)
+
+        first = day_bars.iloc[0]
+        ref_close = float(first["Close"])  # 0° reference
+        levels = gann_degree_levels(ref_close)
+        levels["_ref"] = "first_15m"
+        levels["_ref_time"] = str(day_bars.index[0])
+        levels["_ref_high"] = float(first["High"])
+        levels["_ref_low"] = float(first["Low"])
+        # classic pivots from same candle for AI suggestions compatibility
+        classic = generate_levels(float(first["High"]), float(first["Low"]), ref_close)
+        levels.update({k: v for k, v in classic.items() if k.startswith(("R", "S", "pivot"))})
+        return levels
+    except Exception:
+        return {}
 
 def generate_suggestions(price: float, levels: Dict) -> List[Dict]:
     if not levels or price <= 0:
@@ -410,7 +480,9 @@ with main_col:
         data = fetch_stock_data(yf_sym)
         price = data["currentPrice"]
         chg = data["changePercent"]
-        levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or price)
+        levels = get_session_fixed_levels(yf_sym)
+        if not levels:
+            levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or price)
         suggestions = generate_suggestions(price, levels)
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -481,9 +553,48 @@ with main_col:
             st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("<div class='card-header'>Support & Resistance Ladder</div>", unsafe_allow_html=True)
-        st.markdown("<div class='card-sub'>S1–S5 / R1–R5 from last available day OHLC</div>", unsafe_allow_html=True)
-        if levels:
+        st.markdown("<div class='card-header'>Degree Level Ladder (Gann Framework)</div>", unsafe_allow_html=True)
+        ref_note = levels.get('_ref_time', 'session') if levels else 'session'
+        ref_px = levels.get('_ref_close', 0) if levels else 0
+        st.markdown(
+            f"<div class='card-sub'>0° = first 15-min close ({format_price(ref_px)}) · levels FIXED until market close · educational references only</div>",
+            unsafe_allow_html=True
+        )
+        if levels and levels.get("_type") == "gann_degree":
+            # Show degrees above reference (360 → 45), then 0°, then below (45 → 360)
+            up_degrees = [360, 315, 270, 225, 180, 135, 90, 45]
+            for deg in up_degrees:
+                key = f"U{deg}"
+                val = levels.get(key, 0)
+                pct = ((val - price) / price * 100) if price else 0
+                st.markdown(
+                    f"<div class='level-row level-resistance'>"
+                    f"<span><b style='color:#f87171'>{deg}°</b> &nbsp; {format_price(val)} &nbsp; "
+                    f"<span style='color:#64748b;font-size:0.75rem'>above 0°</span></span>"
+                    f"<span class='down'>{format_percent(pct)}</span></div>",
+                    unsafe_allow_html=True
+                )
+            # 0° reference
+            st.markdown(
+                f"<div style='text-align:center;padding:10px;background:rgba(251,191,36,0.14);border-radius:10px;margin:8px 0;border:1px solid rgba(251,191,36,0.4)'>"
+                f"<span class='amber'><b>0°</b> &nbsp; Reference &nbsp; {format_price(ref_px)}</span>"
+                f"<div style='font-size:0.75rem;color:#94a3b8;margin-top:2px'>Current price: {format_price(price)}</div></div>",
+                unsafe_allow_html=True
+            )
+            down_degrees = [45, 90, 135, 180, 225, 270, 315, 360]
+            for deg in down_degrees:
+                key = f"D{deg}"
+                val = levels.get(key, 0)
+                pct = ((val - price) / price * 100) if price else 0
+                st.markdown(
+                    f"<div class='level-row level-support'>"
+                    f"<span><b style='color:#34d399'>{deg}°</b> &nbsp; {format_price(val)} &nbsp; "
+                    f"<span style='color:#64748b;font-size:0.75rem'>below 0°</span></span>"
+                    f"<span class='up'>{format_percent(pct)}</span></div>",
+                    unsafe_allow_html=True
+                )
+            st.caption("Degree levels are potential price references only — not guaranteed reversals. Always define entry, stop, target and risk before trading.")
+        elif levels:
             for key in ["R5", "R4", "R3", "R2", "R1"]:
                 val = levels.get(key, 0)
                 pct = ((val - price) / price * 100) if price else 0
@@ -770,7 +881,9 @@ with side_col:
         if user_msg:
             st.session_state.chat_history.append({"role": "user", "text": user_msg})
             data = fetch_stock_data(st.session_state.selected_yf)
-            levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or data["currentPrice"])
+            levels = get_session_fixed_levels(st.session_state.selected_yf)
+            if not levels:
+                levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or data["currentPrice"])
             reply = ai_chat(user_msg, st.session_state.selected_symbol, data, levels)
             st.session_state.chat_history.append({"role": "assistant", "text": reply})
             st.rerun()
@@ -778,13 +891,17 @@ with side_col:
         if c1.button("Support?", use_container_width=True):
             st.session_state.chat_history.append({"role": "user", "text": "What are support levels?"})
             data = fetch_stock_data(st.session_state.selected_yf)
-            levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or data["currentPrice"])
+            levels = get_session_fixed_levels(st.session_state.selected_yf)
+            if not levels:
+                levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or data["currentPrice"])
             st.session_state.chat_history.append({"role": "assistant", "text": ai_chat("support", st.session_state.selected_symbol, data, levels)})
             st.rerun()
         if c2.button("Bullish?", use_container_width=True):
             st.session_state.chat_history.append({"role": "user", "text": "Bullish setup?"})
             data = fetch_stock_data(st.session_state.selected_yf)
-            levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or data["currentPrice"])
+            levels = get_session_fixed_levels(st.session_state.selected_yf)
+            if not levels:
+                levels = generate_levels(data["dayHigh"], data["dayLow"], data["previousClose"] or data["currentPrice"])
             st.session_state.chat_history.append({"role": "assistant", "text": ai_chat("bullish", st.session_state.selected_symbol, data, levels)})
             st.rerun()
 
