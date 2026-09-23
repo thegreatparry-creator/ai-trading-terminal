@@ -736,7 +736,7 @@ with tab1:
 
             st.markdown("---")
 
-        # Determine position of current price relative to levels
+      # Determine position of current price relative to levels
 price = quant['price']
 status_list = []
 
@@ -768,22 +768,24 @@ for level in ["r4", "r3", "r2", "r1", "s1", "s2", "s3", "s4"]:
 st.markdown("### 🎯 Price Position Relative to Levels")
 pos_df = pd.DataFrame(status_list)
 st.dataframe(pos_df, use_container_width=True)
-            st.markdown("### 🎯 Traditional Pivot Levels")
-            pivot_rows = []
-            for level in ["4", "3", "2", "1"]:
-                r_raw = quant.get(f'r{level}')
-                s_raw = quant.get(f's{level}')
-                try:
-                    r_val = float(r_raw) if r_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    r_val = 0.0
-                try:
-                    s_val = float(s_raw) if s_raw is not None else 0.0
-                except (ValueError, TypeError):
-                    s_val = 0.0
-                pivot_rows.append({"Resistance": r_val, "Support": s_val})
-            levels_df = pd.DataFrame(pivot_rows, index=["Level 4", "Level 3", "Level 2", "Level 1"])
-            st.dataframe(levels_df, use_container_width=True)
+
+# Correct indentation here:
+st.markdown("### 🎯 Traditional Pivot Levels")
+pivot_rows = []
+for level in ["4", "3", "2", "1"]:
+    r_raw = quant.get(f'r{level}')
+    s_raw = quant.get(f's{level}')
+    try:
+        r_val = float(r_raw) if r_raw is not None else 0.0
+    except (ValueError, TypeError):
+        r_val = 0.0
+    try:
+        s_val = float(s_raw) if s_raw is not None else 0.0
+    except (ValueError, TypeError):
+        s_val = 0.0
+    pivot_rows.append({"Resistance": r_val, "Support": s_val})
+levels_df = pd.DataFrame(pivot_rows, index=["Level 4", "Level 3", "Level 2", "Level 1"])
+st.dataframe(levels_df, use_container_width=True) 
 
         # ---------- AI SUGGESTIONS (right, beside live analysis) ----------
         with col_ai:
