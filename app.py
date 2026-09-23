@@ -50,8 +50,7 @@ def send_telegram_alert(message):
 
 
 groq_client = Groq(api_key=GROQ_KEY)
-gemini_client = genai.Client(api_key=GEMINI_KEY)
-
+genai.configure(api_key=GEMINI_KEY)
 
 # ================== AI MODEL MAPS ==================
 # Groq retired llama-3.1-8b-instant / llama-3.3-70b-versatile for free & dev-tier keys
