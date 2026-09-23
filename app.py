@@ -26,10 +26,548 @@ def secret(name):
         return os.getenv(name, "")
 
 
-GROQ_KEY = secret("GROQ_KEY")
+GROQ_KEY = secret("# 1. Install Required Libraries
+!pip install -q -U google-genai groq yfinance pandas numpy
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import email.utils
+import math
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from google import genai
+from google.genai.errors import ServerError
+from groq import Groq
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# 2. Configure Dual Free AI Keys
+GEMINI_KEY = "AQ.Ab8RN6JtGdVf9VFtpeo2_7BYDuZQZZlhMIbQxKFX1noZ4UnTSQ"
+GROQ_KEY = "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"
+
+gemini_client = genai.Client(api_key=GEMINI_KEY)
+groq_client = Groq(api_key=GROQ_KEY)
+
+
+def call_gemini(prompt):
+    for model in ["gemini-3.6-flash", "gemini-3.5-flash-lite"]:
+        try:
+            chat = gemini_client.chats.create(model=model)
+            return chat.send_message(prompt).text
+        except Exception:
+            time.sleep(0.5)
+    return None
+
+
+def call_groq(prompt):
+    try:
+        res = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return res.choices[0].message.content
+    except Exception:
+        return None
+
+
+def run_hybrid_agent(preferred_engine, role, task):
+    prompt = f"ROLE: {role}\nTASK: {task}\nProvide a concise, ultra-sharp bulleted response."
+    if preferred_engine == "groq":
+        out = call_groq(prompt) or call_gemini(prompt)
+    else:
+        out = call_gemini(prompt) or call_groq(prompt)
+    return out if out else "Analysis unavailable."
+
+
+def shorten_link(long_url):
+    try:
+        if len(long_url) < 45:
+            return long_url
+        api_url = (
+            "http://tinyurl.com/api-create.php?"
+            + urllib.parse.urlencode({"url": long_url})
+        )
+        req = urllib.request.Request(
+            api_url, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.read().decode("utf-8").strip()
+    except Exception:
+        return long_url[:40] + "..."
+
+
+# ======================================================================
+# 1. PRE-MARKET & REAL-TIME CANDLESTICK PATTERN ENGINE
+# ======================================================================
+def detect_candle_patterns_and_structure(df):
+    """Scans OHLCV price action for classic institutional candlestick patterns."""
+    if len(df) < 3:
+        return "Insufficient candle history."
+
+    c = df["Close"].values
+    o = df["Open"].values
+    h = df["High"].values
+    l = df["Low"].values
+
+    curr_body = abs(c[-1] - o[-1])
+    curr_range = h[-1] - l[-1] if h[-1] != l[-1] else 0.001
+    prev_body = abs(c[-2] - o[-2])
+
+    patterns = []
+
+    # 1. Bullish & Bearish Engulfing
+    if (
+        c[-1] > o[-1]
+        and c[-2] < o[-2]
+        and c[-1] >= o[-2]
+        and o[-1] <= c[-2]
+        and curr_body > prev_body
+    ):
+        patterns.append("🔥 Bullish Engulfing (Reversal Signal)")
+    elif (
+        c[-1] < o[-1]
+        and c[-2] > o[-2]
+        and o[-1] >= c[-2]
+        and c[-1] <= o[-2]
+        and curr_body > prev_body
+    ):
+        patterns.append("⚠️ Bearish Engulfing (Reversal Signal)")
+
+    # 2. Hammer & Shooting Star
+    lower_wick = min(o[-1], c[-1]) - l[-1]
+    upper_wick = h[-1] - max(o[-1], c[-1])
+    if lower_wick >= 2 * curr_body and upper_wick <= 0.2 * curr_body:
+        patterns.append("🔨 Bullish Hammer / Pinbar (Buyer Defense at Lows)")
+    elif upper_wick >= 2 * curr_body and lower_wick <= 0.2 * curr_body:
+        patterns.append("🌠 Bearish Shooting Star (Seller Defense at Highs)")
+
+    # 3. Inside Bar Compression
+    if h[-1] < h[-2] and l[-1] > l[-2]:
+        patterns.append("⏳ Inside Bar Compression (Volatility Squeeze Imminent)")
+
+    return " | ".join(patterns) if patterns else "Standard Price Action Candle"
+
+
+def calculate_pinescript_quant_signals(ticker_symbol):
+    """Calculates Pre-Market Gap, Gann Square of 9, Dynamic EMAs, Golden Pocket & Patterns."""
+    try:
+        stock = yf.Ticker(ticker_symbol)
+
+        # Download Intraday Data INCLUDING Pre-Market / After-Hours
+        df_15m = stock.history(period="5d", interval="15m", prepost=True)
+        df_daily = stock.history(period="3mo", interval="1d")
+
+        if df_15m.empty:
+            df_15m = df_daily
+
+        last_close = float(df_15m["Close"].iloc[-1])
+
+        # --- Pre-Market Opening Structure ---
+        prev_day_close = (
+            float(df_daily["Close"].iloc[-2])
+            if len(df_daily) >= 2
+            else last_close
+        )
+        pre_market_high = float(df_15m["High"].iloc[-10:].max())
+        pre_market_low = float(df_15m["Low"].iloc[-10:].min())
+        gap_pct = round(
+            ((last_close - prev_day_close) / prev_day_close) * 100, 2
+        )
+        gap_status = (
+            f"Gap Up (+{gap_pct}%)"
+            if gap_pct > 0.3
+            else (f"Gap Down ({gap_pct}%)" if gap_pct < -0.3 else "Flat Open")
+        )
+
+        # --- Candlestick Pattern Detection ---
+        candle_pattern = detect_candle_patterns_and_structure(df_15m)
+
+        # --- Gann Square of 9 ---
+        anchor_price = float(df_15m["Close"].iloc[-min(25, len(df_15m))])
+        anchor_sqrt = math.sqrt(anchor_price)
+
+        def calc_sq9(root, deg, is_r):
+            delta = deg / 180.0
+            return (
+                math.pow(root + delta, 2)
+                if is_r
+                else math.pow(max(0.1, root - delta), 2)
+            )
+
+        r225, r450, r675, r900, r180 = (
+            calc_sq9(anchor_sqrt, d, True)
+            for d in [22.5, 45.0, 67.5, 90.0, 180.0]
+        )
+        s225, s450, s675, s900, s180 = (
+            calc_sq9(anchor_sqrt, d, False)
+            for d in [22.5, 45.0, 67.5, 90.0, 180.0]
+        )
+
+        # --- Dynamic EMAs ---
+        ema20 = df_15m["Close"].ewm(span=20).mean().iloc[-1]
+        ema50 = df_15m["Close"].ewm(span=50).mean().iloc[-1]
+        trend_up = ema20 >= ema50
+        fast_src = df_15m["Low"] if trend_up else df_15m["High"]
+        slow_src = df_15m["Low"] if trend_up else df_15m["High"]
+        fast_ema = fast_src.ewm(span=9).mean().iloc[-1]
+        slow_ema = slow_src.ewm(span=50).mean().iloc[-1]
+        ema_bias = (
+            "BULLISH (Fast > Slow EMA)"
+            if fast_ema > slow_ema
+            else "BEARISH (Fast < Slow EMA)"
+        )
+
+        # --- Wave Target & Golden Pocket ---
+        highs = df_15m["High"].values
+        lows = df_15m["Low"].values
+        pA = np.min(lows[-15:])
+        pB = np.max(highs[-15:])
+        pC = lows[-1]
+        wave_target = (pB * pC) / pA if pA > 0 else last_close * 1.03
+        fib_500 = pB - (0.500 * (pB - pA))
+        fib_618 = pB - (0.618 * (pB - pA))
+
+        # --- Candle 3-5-9 Streak ---
+        is_green = df_15m["Close"] > df_15m["Open"]
+        green_streak = (
+            int(is_green.iloc[::-1].cumprod().sum())
+            if is_green.iloc[-1]
+            else 0
+        )
+        red_streak = (
+            int((~is_green).iloc[::-1].cumprod().sum())
+            if not is_green.iloc[-1]
+            else 0
+        )
+        streak_signal = (
+            f"Exhaustion Warning ({green_streak} green bars)"
+            if green_streak in [3, 5, 9]
+            else (
+                f"Exhaustion Warning ({red_streak} red bars)"
+                if red_streak in [3, 5, 9]
+                else "Normal Progression"
+            )
+        )
+
+        quant_summary = f"""
+        === 📊 REAL-TIME CANDLES & PRE-MARKET STRUCTURE: {ticker_symbol} ===
+        - Live Close: {round(last_close, 2)}
+        - Pre-Market Gap Structure: {gap_status} (Prev Close: {round(prev_day_close, 2)})
+        - Pre-Market High (PMH): {round(pre_market_high, 2)} | Pre-Market Low (PML): {round(pre_market_low, 2)}
+        - Live Candle Pattern Detected: {candle_pattern}
+        - Gann Anchor (1st 15m): {round(anchor_price, 2)} (sqrt: {round(anchor_sqrt, 4)})
+        - Gann Resistances (R): 22.5°: {round(r225, 2)} | 45°: {round(r450, 2)} | 90°: {round(r900, 2)} | 180°: {round(r180, 2)}
+        - Gann Supports (S): 22.5°: {round(s225, 2)} | 45°: {round(s450, 2)} | 90°: {round(s900, 2)} | 180°: {round(s180, 2)}
+        - Dynamic EMAs: Fast(9)={round(fast_ema, 2)} vs Slow(50)={round(slow_ema, 2)} ({ema_bias})
+        - Golden Pocket: {round(fib_618, 2)} - {round(fib_500, 2)} | Wave Target ((B*C)/A): {round(wave_target, 2)}
+        - Candle Exhaustion: {streak_signal}
+        """
+        return quant_summary, last_close
+    except Exception as e:
+        return f"Quant computation fallback: {str(e)}", 0.0
+
+
+# ======================================================================
+# 2. MULTI-SOURCE GLOBAL NEWS WIRE HARVESTER
+# ======================================================================
+def fetch_multi_source_global_news(ticker_symbol):
+    clean_keyword = (
+        ticker_symbol.replace(".NS", "")
+        .replace(".BO", "")
+        .replace(".L", "")
+        .replace(".DE", "")
+        .replace("-USD", "")
+        .replace("=F", "")
+    )
+
+    queries = [
+        f"{clean_keyword} stock site:moneycontrol.com OR site:economictimes.indiatimes.com",
+        f"{clean_keyword} site:investing.com OR site:tradingview.com",
+        f"{clean_keyword} stock breaking news financial",
+    ]
+
+    collected_articles = []
+    seen_titles = set()
+
+    for q in queries:
+        try:
+            encoded_query = urllib.parse.quote(q)
+            rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-IN&gl=IN&ceid=IN:en"
+            req = urllib.request.Request(
+                rss_url, headers={"User-Agent": "Mozilla/5.0"}
+            )
+
+            with urllib.request.urlopen(req, timeout=4) as response:
+                root = ET.fromstring(response.read())
+                for item in root.findall(".//item")[:4]:
+                    title = item.findtext("title", "").strip()
+                    link = item.findtext("link", "").strip()
+                    pub_date = item.findtext("pubDate", "").strip()
+                    source = (
+                        item.find("source").text.strip()
+                        if item.find("source") is not None
+                        else "Financial Wire"
+                    )
+
+                    if title and title not in seen_titles:
+                        seen_titles.add(title)
+                        short_url = shorten_link(link)
+                        collected_articles.append(
+                            {
+                                "title": title,
+                                "link": short_url,
+                                "source": source,
+                                "time": pub_date,
+                            }
+                        )
+        except Exception:
+            pass
+
+    try:
+        stock = yf.Ticker(ticker_symbol)
+        for n in (stock.news or [])[:2]:
+            title = n.get("title") or (
+                n.get("content", {}).get("title")
+                if isinstance(n.get("content"), dict)
+                else None
+            )
+            link = (
+                n.get("link")
+                or n.get("clickThroughUrl", {}).get("url")
+                or (
+                    n.get("content", {}).get("canonicalUrl", {})
+                    if isinstance(n.get("content"), dict)
+                    else None
+                )
+            )
+            publisher = n.get("publisher") or (
+                n.get("content", {}).get("provider", {}).get("displayName")
+                if isinstance(n.get("content"), dict)
+                else "Yahoo Wire"
+            )
+
+            if title and title not in seen_titles:
+                seen_titles.add(title)
+                short_url = shorten_link(link or "https://finance.yahoo.com")
+                collected_articles.append(
+                    {
+                        "title": title,
+                        "link": short_url,
+                        "source": publisher,
+                        "time": "Recent",
+                    }
+                )
+    except Exception:
+        pass
+
+    breaking_news, recent_news = [], []
+    for art in collected_articles:
+        formatted_entry = f"• [{art['source']}] {art['title']} ({art['time']})\n  Link: {art['link']}"
+        is_breaking = False
+        try:
+            parsed_time = email.utils.parsedate_to_datetime(art["time"])
+            if (
+                datetime.now(parsed_time.tzinfo) - parsed_time
+            ).total_seconds() <= 86400:
+                is_breaking = True
+        except Exception:
+            if (
+                "hours ago" in art["time"].lower()
+                or "mins ago" in art["time"].lower()
+            ):
+                is_breaking = True
+
+        if is_breaking:
+            breaking_news.append(formatted_entry)
+        else:
+            recent_news.append(formatted_entry)
+
+    breaking_text = (
+        "\n".join(breaking_news)
+        if breaking_news
+        else "• No urgent breaking headlines in the past 24 hours."
+    )
+    recent_text = (
+        "\n".join(recent_news[:3])
+        if recent_news
+        else "• No recent news context available."
+    )
+
+    return f"""
+    --- ⚡ BREAKING NEWS (LAST 24H) ---
+    {breaking_text}
+
+    --- 📅 RECENT NEWS (PAST 7-30D) ---
+    {recent_text}
+    """
+
+
+def fetch_deep_market_context(ticker_symbol):
+    try:
+        stock = yf.Ticker(ticker_symbol)
+        info = stock.info or {}
+        pe = info.get("trailingPE", "N/A")
+        fwd_pe = info.get("forwardPE", "N/A")
+        margin = info.get("profitMargins", "N/A")
+        growth = info.get("revenueGrowth", "N/A")
+        short_float = info.get("shortPercentOfFloat", "N/A")
+
+        multi_wire_news = fetch_multi_source_global_news(ticker_symbol)
+
+        dataset = f"""
+        VALUATION: P/E: {pe} | Forward P/E: {fwd_pe} | Margin: {margin} | Growth: {growth} | Short Float: {short_float}
+        {multi_wire_news}
+        """
+        return dataset, multi_wire_news
+    except Exception as e:
+        return f"Context error: {str(e)}", "No news feeds available."
+
+
+# ======================================================================
+# 3. DUAL-AI QUANT & NEWS DESK EXECUTION
+# ======================================================================
+def execute_trading_desk_master(ticker_symbol):
+    start_time = time.time()
+    ticker = ticker_symbol.split(" ")[0].strip().upper()
+
+    print("=" * 65)
+    print(f"🚀 RUNNING REAL-TIME CANDLES & DUAL-AI DESK FOR: {ticker}")
+    print("=" * 65)
+
+    quant_hud, last_price = calculate_pinescript_quant_signals(ticker)
+    market_context, news_dossier = fetch_deep_market_context(ticker)
+
+    tasks = {
+        "technicals_and_pinescript": (
+            "groq",
+            "PineScript & Candle Pattern Quant Specialist",
+            f"Analyze candle patterns, Pre-Market Gap, Gann Square of 9 levels, Dynamic EMAs, and Wave Target for {ticker}:\n{quant_hud}",
+        ),
+        "fundamentals": (
+            "gemini",
+            "Equity Fundamental Analyst",
+            f"Audit P/E ratios and profit margins for {ticker}:\n{market_context}",
+        ),
+        "sentiment": (
+            "gemini",
+            "Market Sentiment & Breaking News Analyst",
+            f"Compare 24h breaking news vs 30-day sentiment momentum for {ticker}:\n{news_dossier}",
+        ),
+        "geopolitical": (
+            "gemini",
+            "Geopolitical Risk Analyst",
+            f"Audit trade barriers and regulatory risks for {ticker}.",
+        ),
+        "forensics": (
+            "gemini",
+            "Financial Forensics Analyst",
+            f"Check accounting health and debt maturity for {ticker}.",
+        ),
+        "shorts": (
+            "groq",
+            "Short-Seller & Insider Analyst",
+            f"Examine short float squeeze dynamics for {ticker}.",
+        ),
+        "earnings": (
+            "groq",
+            "Pre-Earnings Analyst",
+            f"Check earnings estimate revisions for {ticker}.",
+        ),
+        "scenarios": (
+            "groq",
+            "Scenario Modeler",
+            f"Model breakout targets vs breakdown support levels for {ticker}.",
+        ),
+    }
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_agent = {
+            executor.submit(run_hybrid_agent, engine, role, task): key
+            for key, (engine, role, task) in tasks.items()
+        }
+        for future in future_to_agent:
+            key = future_to_agent[future]
+            results[key] = future.result()
+
+    chief_trader_prompt = f"""
+    You are a 20+ Year Veteran Institutional Trader.
+    Synthesize the Real-Time Candle Patterns, Pre-Market Structure, PineScript Quant Calculations, and 8 Specialist Reports from Gemini and Groq for {ticker}:
+
+    --- CANDLE PATTERNS & QUANT HUD ---
+    {quant_hud}
+
+    --- VALUATION & NEWS ---
+    {market_context}
+
+    --- SPECIALIST INTELLIGENCE ---
+    - PINESCRIPT & CANDLE PATTERNS (Groq): {results['technicals_and_pinescript']}
+    - FUNDAMENTALS (Gemini): {results['fundamentals']}
+    - SENTIMENT (Gemini): {results['sentiment']}
+    - GEOPOLITICS (Gemini): {results['geopolitical']}
+    - FORENSICS (Gemini): {results['forensics']}
+    - SHORTS (Groq): {results['shorts']}
+    - EARNINGS (Groq): {results['earnings']}
+    - SCENARIOS (Groq): {results['scenarios']}
+
+    Deliver a sharp, clean, institutional briefing with concise bullet points:
+
+    ======================================================================
+    🎯 1. INTRADAY TRADING ACTION (15m / Scalp Horizon)
+    ======================================================================
+    • ACTION BUTTON: [🟢 BUY NOW / 🔴 SELL / SHORT / 🟡 WAIT FOR LEVEL]
+    • CANDLE & PRE-MARKET SETUP: [Gap structure & detected candlestick pattern status]
+    • ENTRY ZONE: [Exact price range based on PMH/PML and Gann Support]
+    • STOP LOSS: [Exact invalidation price based on Gann 22.5°/45°]
+    • TARGET 1 (Conservative - 45°/90°): [Price]
+    • TARGET 2 (Aggressive - Wave Target): [Price]
+    • RISK / REWARD: [e.g., 1:2.5]
+    • WHY (1-2 lines): [Why enter here based on pattern and Gann support]
+
+    ======================================================================
+    📈 2. SWING TRADE ACTION (Multi-Day to Multi-Week)
+    ======================================================================
+    • ACTION BUTTON: [🟢 ACCUMULATE / 🔴 EXIT / 🟡 HOLD]
+    • BUY ZONE: [Golden Pocket price range]
+    • SWING STOP LOSS: [180° Major Gann floor]
+    • SWING TARGETS: [Target 1 / Target 2 / Target 3]
+    • TIMEFRAME: [e.g., 5-15 Days]
+    • WHY (1-2 lines): [Macro and fundamental thesis]
+
+    ======================================================================
+    📰 3. NEWS MOMENTUM & SHORT LINKS
+    ======================================================================
+    • News Verdict (1 line): [Is sentiment accelerating or decelerating?]
+{news_dossier}
+
+    ======================================================================
+    🔍 4. TRADE CONVICTION SCORE
+    ======================================================================
+    • Conviction Rating: [Score: 1 - 10]
+    • Model Consensus: [Brief confirmation: Gemini + Groq agreement]
+    """
+
+    final_action_plan = run_hybrid_agent(
+        "groq",
+        "Chief Trade Execution Officer (20-Year Veteran)",
+        chief_trader_prompt,
+    )
+    elapsed = round(time.time() - start_time, 2)
+
+    print("\n" + "=" * 65)
+    print(f"INSTITUTIONAL TRADE BRIEF: {ticker} (Generated in {elapsed}s)")
+    print("=" * 65)
+    print(final_action_plan)
+
+
+print(" Real-Time Candle & Pre-Market Engine Configured!")")
 GEMINI_KEY = secret("GEMINI_KEY")
-TELEGRAM_BOT_TOKEN = secret("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = secret("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = secret("8794257218:AAGYGDqPUEJdI3UahL07Pe86IgcLCfIn20g")
+TELEGRAM_CHAT_ID = secret("8600332637")
 
 groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 # google-generativeai (old SDK) is deprecated; using the current google-genai SDK.
@@ -383,6 +921,33 @@ def render_ladder(ladder, band, current_price):
         )
 
 
+def render_price_position(price, ladder, band):
+    st.markdown("#### 🎯 Live Price Position")
+    st.caption("The current price is shown relative to the Gann levels below.")
+    if band == "below":
+        st.warning(
+            f"⬇️ Price **{price:.2f}** is BELOW every calculated level "
+            f"(lowest: {ladder[0]['label']} @ {ladder[0]['value']:.2f}) — possible breakdown zone."
+        )
+    elif band == "above":
+        st.warning(
+            f"⬆️ Price **{price:.2f}** is ABOVE every calculated level "
+            f"(highest: {ladder[-1]['label']} @ {ladder[-1]['value']:.2f}) — possible breakout zone."
+        )
+    else:
+        lo, hi = band
+        st.success(
+            f"💰 Price **{price:.2f}** is between **{lo['label']}** ({lo['value']:.2f}) "
+            f"and **{hi['label']}** ({hi['value']:.2f})"
+        )
+        span = hi["value"] - lo["value"]
+        pct = (price - lo["value"]) / span if span else 0
+        st.progress(
+            min(max(pct, 0.0), 1.0),
+            text=f"{pct * 100:.1f}% of the way from {lo['label']} to {hi['label']}",
+        )
+
+
 # ================== NEWS PIPELINE ==================
 @st.cache_data(ttl=180, show_spinner=False)
 def get_news():
@@ -486,7 +1051,11 @@ def levels(data):
 
 def get_trade_suggestion(ticker, price, q, ladder, band, articles):
     if not groq_client:
-        return "⚠️ Configure GROQ_KEY in .streamlit/secrets.toml to enable AI suggestions."
+        return (
+            "⚠️ AI is not connected. Add `GROQ_KEY` to Replit Secrets, or add "
+            "`GROQ_KEY = \"your-key\"` to `.streamlit/secrets.toml` when running "
+            "this script outside Replit, then restart the app."
+        )
     band_text = (f"between {band[0]['label']} ({band[0]['value']:.2f}) and {band[1]['label']} ({band[1]['value']:.2f})"
                  if isinstance(band, tuple) else f"{band} every calculated level")
     news_text = "\n".join(f"- {a['title']} (impact {a['impact']['label']} {a['impact']['score']}/10)" for a in articles[:5]) or "No relevant news."
@@ -564,19 +1133,6 @@ with tab_live:
         b.metric("Company", info.get("longName", symbol))
         c.metric("Related stories", len(articles))
 
-        st.subheader("🎯 Live Price Position")
-        st.caption("0° = today's opening 15-min candle. Every level below is calculated from that anchor, in real time.")
-        if band == "below":
-            st.warning(f"⬇️ Price **{price:.2f}** is BELOW every calculated level (lowest: {ladder[0]['label']} @ {ladder[0]['value']:.2f}) — possible breakdown zone.")
-        elif band == "above":
-            st.warning(f"⬆️ Price **{price:.2f}** is ABOVE every calculated level (highest: {ladder[-1]['label']} @ {ladder[-1]['value']:.2f}) — possible breakout zone.")
-        else:
-            lo, hi = band
-            st.success(f"💰 Price **{price:.2f}** is between **{lo['label']}** ({lo['value']:.2f}) and **{hi['label']}** ({hi['value']:.2f})")
-            span = hi["value"] - lo["value"]
-            pct = (price - lo["value"]) / span if span else 0
-            st.progress(min(max(pct, 0.0), 1.0), text=f"{pct * 100:.1f}% of the way from {lo['label']} to {hi['label']}")
-
         if not chart_df.empty:
             zoom = zoom_window(ladder, band, price, context=1)
             fig = go.Figure(go.Candlestick(x=list(range(len(chart_df))), open=chart_df.Open, high=chart_df.High,
@@ -637,7 +1193,8 @@ with tab_live:
         else:
             st.caption("No intraday candle data available for this symbol right now.")
 
-        st.markdown("**📐 Full Gann Ladder**")
+        st.subheader("📐 Full Gann Ladder")
+        render_price_position(price, ladder, band)
         render_ladder(ladder, band, price)
 
         st.subheader("🧠 Smart Money Zones")
@@ -703,7 +1260,12 @@ with tab_chat:
             with st.spinner("Thinking..."):
                 try:
                     if model_choice in GROQ_MODELS:
-                        answer = ("⚠️ Configure GROQ_KEY in .streamlit/secrets.toml." if not groq_client else
+                        answer = (
+                            "⚠️ AI is not connected. Add `GROQ_KEY` to Replit Secrets, or add "
+                            "`GROQ_KEY = \"your-key\"` to `.streamlit/secrets.toml` when running "
+                            "this script outside Replit, then restart the app."
+                            if not groq_client
+                            else
                                   groq_client.chat.completions.create(
                                       model=GROQ_MODELS[model_choice],
                                       messages=[{"role": "system", "content": f"Trading assistant for {symbol}. Educational only. Context:\n{context}"},
