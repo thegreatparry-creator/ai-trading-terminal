@@ -125,7 +125,8 @@ div[data-testid="stMetricValue"]{font-size:1.25rem!important}
 .ladder-row.resistance{background:rgba(224,82,82,.08)}.ladder-row.support{background:rgba(38,162,105,.08)}
 .ladder-row.anchor{background:rgba(59,130,246,.14);font-weight:700}
 .ladder-row.current{outline:2px solid #f4c542;background:rgba(244,197,66,.2);font-weight:700}
-@media(max-width:640px){h1{font-size:1.4rem!important}.zone-grid{grid-template-columns:1fr}.news-title{font-size:1rem}}
+.ladder-distance{display:inline-block;margin-left:8px;font-size:.72rem;opacity:.7;font-weight:400}
+@media(max-width:640px){h1{font-size:1.4rem!important}.zone-grid{grid-template-columns:1fr}.news-title{font-size:1rem}.ladder-row{font-size:.85rem;padding:8px 9px}.ladder-distance{display:block;margin-left:0;margin-top:2px}}
 </style>
 """, unsafe_allow_html=True)
 st.title("🎯 AI Trading Terminal - PRO")
@@ -159,7 +160,7 @@ def yahoo_search(query, limit=8):
         return []
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def fast_quote(ticker):
     """Real-time-ish last price + % change via yfinance's lightweight fast_info."""
     try:
@@ -207,7 +208,7 @@ def get_stock(ticker):
         return pd.DataFrame(), {}
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=15)
 def get_intraday(ticker):
     """Last ~2 trading sessions of 15-min candles + that day's opening price (the 0° Gann anchor)."""
     try:
@@ -291,35 +292,6 @@ def zoom_window(ladder, band, price, context=1):
     return y_min - pad, y_max + pad, window
 
 
-def detect_order_block(price_df, lookback=60, impulse_atr_mult=1.8, search_back=6):
-    """Simplified SMC order-block heuristic — a zone to watch, not a signal on its own."""
-    if price_df is None or len(price_df) < 15:
-        return None
-    d = price_df.tail(lookback).copy()
-    d["body"] = (d["Close"] - d["Open"]).abs()
-    d["range"] = d["High"] - d["Low"]
-    atr = d["range"].rolling(14, min_periods=5).mean()
-    bullish_ob, bearish_ob = None, None
-    for i in range(len(d) - 2, 0, -1):
-        a = atr.iloc[i]
-        if pd.isna(a) or a == 0 or d["body"].iloc[i] <= impulse_atr_mult * a:
-            continue
-        up, down = d["Close"].iloc[i] > d["Open"].iloc[i], d["Close"].iloc[i] < d["Open"].iloc[i]
-        if up and bullish_ob is None:
-            for j in range(i - 1, max(i - search_back, -1), -1):
-                if d["Close"].iloc[j] < d["Open"].iloc[j]:
-                    bullish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j])}
-                    break
-        if down and bearish_ob is None:
-            for j in range(i - 1, max(i - search_back, -1), -1):
-                if d["Close"].iloc[j] > d["Open"].iloc[j]:
-                    bearish_ob = {"low": float(d["Low"].iloc[j]), "high": float(d["High"].iloc[j])}
-                    break
-        if bullish_ob and bearish_ob:
-            break
-    return {"bullish": bullish_ob, "bearish": bearish_ob} if (bullish_ob or bearish_ob) else None
-
-
 def detect_golden_pocket(price_df, lookback=80):
     if price_df is None or len(price_df) < 15:
         return None
@@ -371,12 +343,29 @@ def render_zone_card(css_class, title, price, zone_low, zone_high, note):
 </div><p>{note}</p></div>""", unsafe_allow_html=True)
 
 
-def render_ladder(ladder, band):
+def render_ladder(ladder, band, current_price):
     for lvl in reversed(ladder):
         css = "anchor" if lvl["side"] == "OPEN" else ("resistance" if lvl["side"] == "R" else "support")
-        if isinstance(band, tuple) and lvl in band:
+        distance = current_price - lvl["value"]
+        if abs(distance) <= 0.005:
             css = "current"
-        st.markdown(f'<div class="ladder-row {css}"><span>{lvl["label"]}</span><span>{lvl["value"]:.2f}</span></div>', unsafe_allow_html=True)
+            distance_text = "CURRENT PRICE"
+        else:
+            distance_text = f"{distance:+.2f} from current"
+        st.markdown(
+            f"""
+            <div class="ladder-row {css}">
+                <span>
+                    <b>{html_module.escape(lvl["label"])}</b>
+                    <small class="ladder-distance">
+                        {html_module.escape(distance_text)}
+                    </small>
+                </span>
+                <span>{lvl["value"]:.2f}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 # ================== NEWS PIPELINE ==================
@@ -547,7 +536,7 @@ band = locate_band(ladder, price)
 # ================== TABS ==================
 tab_live, tab_news, tab_chat, tab_heat, tab_watch, tab_alerts, tab_history = st.tabs(
     ["📊 Live Analysis", "📰 Ranked Stock News", "💬 AI Chat", "📊 Market Heatmap",
-     "📋 Watchlist & Portfolio", "🔔 Alerts & Backtest", "📅 Historical Data"])
+     "📋 Watchlists", "🔔 Alerts & Backtest", "📅 Historical Data"])
 
 # ---------------- TAB: LIVE ANALYSIS ----------------
 with tab_live:
@@ -591,29 +580,52 @@ with tab_live:
             step = max(1, len(chart_df) // 6)
             ticks = list(range(0, len(chart_df), step))
             fig.update_xaxes(tickvals=ticks, ticktext=[chart_df.index[i].strftime("%d %b %H:%M") for i in ticks], tickangle=-30)
-            fig.update_layout(height=440, xaxis_rangeslider_visible=False, margin=dict(l=10, r=100, t=15, b=10))
+            fig.update_layout(
+                height=500,
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(14,20,32,0.92)",
+                hovermode="x unified",
+                xaxis_rangeslider_visible=False,
+                margin=dict(l=12, r=110, t=45, b=55),
+                font=dict(family="Inter, Arial, sans-serif", size=12),
+                title=dict(
+                    text=f"{symbol} · Live 15-minute price action",
+                    x=0.02,
+                    xanchor="left",
+                    font=dict(size=16),
+                ),
+                xaxis=dict(
+                    showgrid=False,
+                    showline=True,
+                    linecolor="rgba(255,255,255,.18)",
+                    zeroline=False,
+                    fixedrange=False,
+                ),
+                yaxis=dict(
+                    showgrid=True,
+                    gridcolor="rgba(255,255,255,.08)",
+                    showline=False,
+                    zeroline=False,
+                    side="right",
+                    fixedrange=False,
+                ),
+            )
+            fig.update_traces(
+                increasing_line_color="#22c55e",
+                increasing_fillcolor="#22c55e",
+                decreasing_line_color="#ef4444",
+                decreasing_fillcolor="#ef4444",
+                selector=dict(type="candlestick"),
+            )
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.caption("No intraday candle data available for this symbol right now.")
 
         st.markdown("**📐 Full Gann Ladder**")
-        render_ladder(ladder, band)
+        render_ladder(ladder, band, price)
 
         st.subheader("🧠 Smart Money Zones")
-        ob = detect_order_block(chart_df)
-        if ob and ob.get("bullish"):
-            lo_ob, hi_ob = ob["bullish"]["low"], ob["bullish"]["high"]
-            inside = lo_ob <= price <= hi_ob
-            render_zone_card("bullish", "📦 Bullish Order Block (Demand)", price, lo_ob, hi_ob,
-                              "Price is currently inside this zone." if inside else "Price is currently outside this zone.")
-        if ob and ob.get("bearish"):
-            lo_ob, hi_ob = ob["bearish"]["low"], ob["bearish"]["high"]
-            inside = lo_ob <= price <= hi_ob
-            render_zone_card("bearish", "📦 Bearish Order Block (Supply)", price, lo_ob, hi_ob,
-                              "Price is currently inside this zone." if inside else "Price is currently outside this zone.")
-        if not ob:
-            st.caption("No clear recent order block detected in this window.")
-
         gp = detect_golden_pocket(chart_df)
         if gp:
             inside = gp["gp_low"] <= price <= gp["gp_high"]
@@ -753,11 +765,11 @@ with tab_heat:
 
 # ---------------- TAB: WATCHLIST & PORTFOLIO ----------------
 with tab_watch:
-    st.header("📋 Watchlist & Portfolio")
+    st.header("📋 Watchlists")
     st.session_state.setdefault("watchlists", {"My Stocks": ["RELIANCE.NS", "TCS.NS", "INFY.NS"], "US Tech": ["AAPL", "MSFT", "NVDA"], "Crypto": ["BTC-USD", "ETH-USD"]})
     st.session_state.setdefault("current_watchlist", "My Stocks")
 
-    wcol1, wcol2 = st.columns(2)
+    wcol1 = st.container()
     with wcol1:
         st.subheader("📋 Watchlists")
         new_list = st.text_input("New watchlist name", key="new_watchlist_name")
@@ -789,36 +801,23 @@ with tab_watch:
                 st.session_state.watchlists[chosen].remove(remove_choice)
                 st.rerun()
 
-    with wcol2:
-        st.subheader("💼 Portfolio Tracker")
-        st.session_state.setdefault("portfolio", {})
-        p1, p2, p3 = st.columns(3)
-        with p1: pticker = st.text_input("Ticker", key="portfolio_ticker")
-        with p2: pqty = st.number_input("Quantity", min_value=1, value=1, key="portfolio_qty")
-        with p3: pbuy = st.number_input("Buy price", min_value=0.01, value=100.0, key="portfolio_buy")
-        if st.button("Add holding", key="portfolio_add") and pticker:
-            st.session_state.portfolio[pticker.upper()] = {"qty": pqty, "buy": pbuy}
-            st.rerun()
-        for ticker, data in list(st.session_state.portfolio.items()):
-            last, _ = fast_quote(ticker)
-            cols = st.columns([3, 1])
-            with cols[0]:
-                if last is not None:
-                    st.metric(ticker, f"{last:.2f}", f"P&L {(last - data['buy']) * data['qty']:.2f}")
-                else:
-                    st.warning(f"Could not fetch {ticker}")
-            with cols[1]:
-                if st.button("🗑️", key=f"remove_portfolio_{ticker}"):
-                    del st.session_state.portfolio[ticker]
-                    st.rerun()
-
 # ---------------- TAB: ALERTS & BACKTEST ----------------
 with tab_alerts:
     st.header("🔔 Alerts & Backtest")
     st.session_state.setdefault("alerts", [])
+    alert_default_price = max(0.01, round(float(price or 0.0), 2))
+    if st.session_state.get("alert_value", alert_default_price) < 0.01:
+        st.session_state["alert_value"] = alert_default_price
+
     x1, x2, x3 = st.columns(3)
     with x1: aticker = st.text_input("Alert ticker", value=symbol, key="alert_ticker")
-    with x2: avalue = st.number_input("Alert price", min_value=0.01, value=float(round(price, 2)), key="alert_value")
+    with x2:
+        avalue = st.number_input(
+            "Alert price",
+            min_value=0.01,
+            value=alert_default_price,
+            key="alert_value",
+        )
     with x3: adirection = st.selectbox("Condition", ["Above", "Below"], key="alert_direction")
     if st.button("Create alert", key="create_alert") and aticker:
         st.session_state.alerts.append({"ticker": aticker.upper(), "price": avalue, "direction": adirection, "notified": False})
