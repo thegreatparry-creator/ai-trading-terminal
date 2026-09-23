@@ -4,5 +4,5 @@ pandas
 numpy
 plotly
 groq
-google-generativeai
+google-genai
 requests
