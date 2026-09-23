@@ -75,7 +75,7 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
-APP_VERSION = "3.1.1"
+APP_VERSION = "3.1.2"
 HTTP_UA = "Mozilla/5.0 (compatible; AI-Trade-Terminal/3.0; +https://streamlit.io)"
 
 # ---------------------------------------------------------------------------
@@ -272,7 +272,11 @@ MODEL_CATALOG: List[ModelSpec] = [
     ModelSpec("Groq · GPT-OSS 20B (fast)", "groq", "openai/gpt-oss-20b"),
     ModelSpec("Groq · GPT-OSS 120B (strongest)", "groq", "openai/gpt-oss-120b"),
     ModelSpec("Groq · Qwen3 32B", "groq", "qwen/qwen3-32b"),
-    ModelSpec("Groq · Kimi K2", "groq", "moonshotai/kimi-k2-instruct"),
+    # v3.1.2: the original kimi-k2-instruct id is being decommissioned on Groq;
+    # the -0905 revision is the supported replacement.
+    ModelSpec("Groq · Kimi K2", "groq", "moonshotai/kimi-k2-instruct-0905"),
+    # v3.1.2: gemini-2.5-flash added as a stable, widely-available fallback.
+    ModelSpec("Gemini · 2.5 Flash (stable)", "gemini", "gemini-2.5-flash"),
     ModelSpec("Gemini · 3.5 Flash", "gemini", "gemini-3.5-flash"),
     ModelSpec("Gemini · 3.1 Pro (preview)", "gemini", "gemini-3.1-pro-preview"),
 ]
@@ -509,14 +513,56 @@ def make_provider(spec: ModelSpec) -> AIProvider:
 
 
 def ai_diagnostics() -> Dict[str, Any]:
+    # v3.1.2: also reports whether secrets.toml itself parses. A single
+    # malformed line (unclosed quote, missing value) makes st.secrets raise
+    # for EVERY key, which silently looks like "all keys missing".
+    secrets_error = ""
+    try:
+        _ = len(st.secrets)          # a malformed secrets file raises here
+    except Exception as exc:
+        secrets_error = safe_error(exc)
     return {
         "app_version": APP_VERSION,
+        "secrets_file_ok": not secrets_error,
+        "secrets_load_error": secrets_error,
         "groq_package": Groq is not None,
         "gemini_package": google_genai is not None,
         "groq_key_configured": bool(provider_key("groq")),
         "gemini_key_configured": bool(provider_key("gemini")),
         "telegram_configured": bool(secret("TELEGRAM_BOT_TOKEN") and secret("TELEGRAM_CHAT_ID")),
     }
+
+
+def fallback_spec(current: ModelSpec) -> Optional[ModelSpec]:
+    """v3.1.2: first configured model on the OTHER provider (Groq <-> Gemini).
+    Returns None when the other provider has no key."""
+    other = "gemini" if current.provider == "groq" else "groq"
+    if not provider_key(other):
+        return None
+    return next((s for s in MODEL_CATALOG if s.provider == other), None)
+
+
+def ai_smoke_test() -> str:
+    """v3.1.2: live-test each configured provider with a tiny request and
+    surface the REAL provider error (never the key value)."""
+    lines: List[str] = []
+    for name in ("groq", "gemini"):
+        if not provider_key(name):
+            lines.append(f"{name}: no key found in secrets")
+            continue
+        try:
+            spec = next((s for s in MODEL_CATALOG if s.provider == name), None)
+            provider = make_provider(spec)
+            text, _ = provider.complete_chat("Reply with OK only.",
+                                             [{"role": "user", "content": "ping"}])
+            lines.append(f"{name}: OK - provider reachable")
+        except Exception as exc:
+            lines.append(f"{name}: FAIL - {friendly_ai_error(exc)}")
+    if not any(provider_key(n) for n in ("groq", "gemini")):
+        lines.append("No AI key loaded. Add GROQ_KEY (free: console.groq.com) or "
+                     "GEMINI_KEY (free: aistudio.google.com) to .streamlit/secrets.toml, "
+                     "then fully restart the app.")
+    return "\n".join(lines)
 
 
 # ===========================================================================
@@ -3134,9 +3180,9 @@ def chat_generate(chat: ChatState, placeholder, user_text: str) -> str:
                 if calls:
                     chat.last_used_tools = _execute_tool_calls(calls)
         except AIUnavailable as exc:
+            # v3.1.2: a failed tool round no longer kills the answer - the plain
+            # reply (with provider fallback) is still attempted below.
             chat.last_error = str(exc)
-            placeholder.markdown(f"⚠️ {exc}")
-            return ""
         except Exception as exc:
             log_exception("chat tool round", exc)   # a failed tool round must not kill the answer
             chat.last_error = safe_error(exc)
@@ -3156,7 +3202,19 @@ def chat_generate(chat: ChatState, placeholder, user_text: str) -> str:
                 placeholder.markdown(text)
     except AIUnavailable as exc:
         chat.last_error = str(exc)
-        placeholder.markdown(f"⚠️ {exc}")
+        fallback = fallback_spec(chat.spec())   # v3.1.2: automatic Groq <-> Gemini fallback
+        if fallback is not None:
+            placeholder.markdown(f"*{chat.spec().provider} unavailable — retrying with "
+                                 f"{fallback.provider}…*")
+            try:
+                for piece in make_provider(fallback).stream_chat(system, chat.messages):
+                    collected.append(piece)
+                    placeholder.markdown("".join(collected))
+                return "".join(collected)
+            except Exception as exc2:
+                log_exception("chat fallback", exc2)
+                chat.last_error = friendly_ai_error(exc2)
+        placeholder.markdown(f"⚠️ {chat.last_error}")
         return ""
     except Exception as exc:
         log_exception("chat stream", exc)
@@ -3931,10 +3989,19 @@ def render_chat_sidebar() -> None:
                                      key="chat_tools")
         chat.stream = st.checkbox("Stream the answer", value=chat.stream, key="chat_stream")
         diagnostics = ai_diagnostics()
-        st.caption(f"Groq key: {'configured' if diagnostics['groq_key_configured'] else 'missing'} · "
-                   f"Gemini key: {'configured' if diagnostics['gemini_key_configured'] else 'missing'} · "
+        if not diagnostics["secrets_file_ok"]:
+            st.error("secrets.toml could not be parsed — ONE bad line disables EVERY key. "
+                     "Each line must be: KEY = \"value\" (straight quotes, value on the same line).")
+            with st.expander("Secrets error detail"):
+                st.code(diagnostics["secrets_load_error"])
+        st.caption(f"Secrets file: {'OK' if diagnostics['secrets_file_ok'] else 'PARSE ERROR'} · "
+                   f"Groq key: {'found' if diagnostics['groq_key_configured'] else 'missing'} · "
+                   f"Gemini key: {'found' if diagnostics['gemini_key_configured'] else 'missing'} · "
                    f"groq pkg: {'yes' if diagnostics['groq_package'] else 'no'} · "
                    f"google-genai pkg: {'yes' if diagnostics['gemini_package'] else 'no'}")
+        if st.button("🧪 Test AI keys now", use_container_width=True, key="chat_test_keys"):
+            with st.spinner("Calling each provider with a tiny test prompt…"):
+                st.text(ai_smoke_test())
 
     # ---- transcript (history survives every Streamlit rerun) ----
     transcript = [m for m in chat.messages if m.get("role") in ("user", "assistant") and m.get("content")]
