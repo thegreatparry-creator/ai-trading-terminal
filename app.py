@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 import email.utils
 from datetime import datetime, timezone, timedelta
 from groq import Groq
-from google import genai as google_genai
+from google import genai as genai
 import requests
 
 
@@ -50,7 +50,7 @@ def send_telegram_alert(message):
 
 
 groq_client = Groq(api_key=GROQ_KEY)
-gemini_client = google_genai.Client(api_key=GEMINI_KEY)
+gemini_client = genai.Client(api_key=GEMINI_KEY)
 
 
 # ================== AI MODEL MAPS ==================
