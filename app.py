@@ -735,6 +735,39 @@ with tab1:
                     st.caption("Not enough recent data to compute a golden pocket.")
 
             st.markdown("---")
+
+        # Determine position of current price relative to levels
+price = quant['price']
+status_list = []
+
+for level in ["r4", "r3", "r2", "r1", "s1", "s2", "s3", "s4"]:
+    val = quant.get(level)
+    try:
+        level_val = float(val) if val is not None else 0.0
+    except (ValueError, TypeError):
+        level_val = 0.0
+
+    if level.startswith('r'):
+        if price > level_val:
+            position = "ABOVE"
+        elif price < level_val:
+            position = "BELOW"
+        else:
+            position = "AT"
+    else:  # support levels
+        if price < level_val:
+            position = "BELOW"
+        elif price > level_val:
+            position = "ABOVE"
+        else:
+            position = "AT"
+
+    status_list.append({"Level": level.upper(), "Level Value": f"${level_val:.2f}", "Position": position})
+
+# Show the current price position
+st.markdown("### 🎯 Price Position Relative to Levels")
+pos_df = pd.DataFrame(status_list)
+st.dataframe(pos_df, use_container_width=True)
             st.markdown("### 🎯 Traditional Pivot Levels")
             pivot_rows = []
             for level in ["4", "3", "2", "1"]:
