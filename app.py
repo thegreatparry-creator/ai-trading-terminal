@@ -75,7 +75,7 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
-APP_VERSION = "3.1.2"
+APP_VERSION = "3.1.4"
 HTTP_UA = "Mozilla/5.0 (compatible; AI-Trade-Terminal/3.0; +https://streamlit.io)"
 
 # ---------------------------------------------------------------------------
@@ -275,7 +275,9 @@ MODEL_CATALOG: List[ModelSpec] = [
     # v3.1.2: the original kimi-k2-instruct id is being decommissioned on Groq;
     # the -0905 revision is the supported replacement.
     ModelSpec("Groq · Kimi K2", "groq", "moonshotai/kimi-k2-instruct-0905"),
-    # v3.1.2: gemini-2.5-flash added as a stable, widely-available fallback.
+    # v3.1.3: gemini-3.8-flash is the current GA model on the Gemini API
+    # (verified against ai.google.dev model list); 2.5-flash retires Oct 2026.
+    ModelSpec("Gemini · 3.8 Flash (GA, latest)", "gemini", "gemini-3.8-flash"),
     ModelSpec("Gemini · 2.5 Flash (stable)", "gemini", "gemini-2.5-flash"),
     ModelSpec("Gemini · 3.5 Flash", "gemini", "gemini-3.5-flash"),
     ModelSpec("Gemini · 3.1 Pro (preview)", "gemini", "gemini-3.1-pro-preview"),
@@ -542,24 +544,56 @@ def fallback_spec(current: ModelSpec) -> Optional[ModelSpec]:
     return next((s for s in MODEL_CATALOG if s.provider == other), None)
 
 
+def _mask_key(value: str) -> str:
+    """v3.1.3: safe key fingerprint - first 4 chars + length, never the value."""
+    if not value:
+        return ""
+    return f"starts '{value[:4]}…', length {len(value)} chars"
+
+
+def _redact_secrets(text: str) -> str:
+    """v3.1.3: strip anything key-shaped from an error message before display."""
+    return re.sub(r"[A-Za-z0-9_\-\.]{18,}", "[redacted]", str(text))
+
+
 def ai_smoke_test() -> str:
-    """v3.1.2: live-test each configured provider with a tiny request and
-    surface the REAL provider error (never the key value)."""
+    """v3.1.3: live-test each configured provider and surface the RAW error
+    (type + message, key-shaped strings redacted) plus a key fingerprint,
+    so 'Invalid or missing API key' can be traced to its real cause."""
     lines: List[str] = []
+    any_key = False
     for name in ("groq", "gemini"):
-        if not provider_key(name):
-            lines.append(f"{name}: no key found in secrets")
+        key = provider_key(name)
+        alias_note = ("GROQ_KEY / GROQ_API_KEY" if name == "groq"
+                      else "GEMINI_KEY / GEMINI_API_KEY / GOOGLE_API_KEY")
+        if not key:
+            lines.append(f"{name}: NO key found in secrets (looked for {alias_note})")
             continue
-        try:
-            spec = next((s for s in MODEL_CATALOG if s.provider == name), None)
-            provider = make_provider(spec)
-            text, _ = provider.complete_chat("Reply with OK only.",
-                                             [{"role": "user", "content": "ping"}])
-            lines.append(f"{name}: OK - provider reachable")
-        except Exception as exc:
-            lines.append(f"{name}: FAIL - {friendly_ai_error(exc)}")
-    if not any(provider_key(n) for n in ("groq", "gemini")):
-        lines.append("No AI key loaded. Add GROQ_KEY (free: console.groq.com) or "
+        any_key = True
+        lines.append(f"{name}: key found ({_mask_key(key)})")
+        if name == "gemini" and key.startswith("AQ."):
+            lines.append("    hint: a value starting 'AQ.' is an OAuth access token, NOT a "
+                         "Gemini API key - Google rejects it with ACCESS_TOKEN_TYPE_UNSUPPORTED. "
+                         "Create a real API key at aistudio.google.com/api-keys (it starts 'AIza').")
+        tried_any = False
+        for spec in [s for s in MODEL_CATALOG if s.provider == name][:2]:
+            tried_any = True
+            try:
+                provider = make_provider(spec)
+                provider.complete_chat("Reply with OK only.",
+                                       [{"role": "user", "content": "ping"}])
+                lines.append(f"{name}: SUCCESS via {spec.model_id} - provider reachable")
+                break
+            except Exception as exc:
+                lines.append(f"{name}: FAIL via {spec.model_id} \u2192 "
+                             f"{type(exc).__name__} | {_redact_secrets(safe_error(exc))[:240]}")
+        if tried_any and "SUCCESS" not in "\n".join(lines[-2:]):
+            lines.append(f"{name}: all tested model ids failed. If a raw error says "
+                         f"'API key not valid', the VALUE in secrets.toml is wrong, truncated, "
+                         f"or pasted with curly quotes \u2014 re-copy it from the provider console. "
+                         f"If it says 403 PERMISSION_DENIED, remove API restrictions on the key.")
+    if not any_key:
+        lines.append("No AI key loaded at all. Add GROQ_KEY (free: console.groq.com) or "
                      "GEMINI_KEY (free: aistudio.google.com) to .streamlit/secrets.toml, "
                      "then fully restart the app.")
     return "\n".join(lines)
