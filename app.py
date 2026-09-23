@@ -20,8 +20,14 @@ WHAT THIS BUILD FIXES (see the report in chat for the full detail)
    provider interface, with an honest LIVE / DELAYED / LAST SESSION / CACHED /
    UNAVAILABLE data-status model (LIVE is never faked).
 5. Market-closed behaviour: the last completed session is always shown.
-6. One bad symbol, one bad news item or one failed AI/API call can never
-   crash the terminal.
+6. ONE BAD SYMBOL, ONE BAD NEWS ITEM OR ONE FAILED AI/API CALL CAN NEVER CRASH
+   THE TERMINAL.
+7. SINGLE-INSTRUMENT QUOTES FIXED (KeyError: 'Close'): yf.download([one_symbol],
+   group_by="ticker") returns MultiIndex columns, so frame["Close"] raised KeyError
+   for every single-symbol quote (dashboard, watchlist, alerts, AI tools) while the
+   multi-symbol heat map worked. The column layout is now normalized in one place.
+8. HEAT-MAP TILES NOW SHOW 'SYMBOL / NAME' (plus price and % change), and the hover
+   carries the full provider name, currency, sector, data status and last bar.
 
 Framework: Streamlit (unchanged). Data: Yahoo Finance via yfinance.
 AI: Groq and Google Gemini (keys from st.secrets / environment).
@@ -69,7 +75,7 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 HTTP_UA = "Mozilla/5.0 (compatible; AI-Trade-Terminal/3.0; +https://streamlit.io)"
 
 # ---------------------------------------------------------------------------
@@ -218,6 +224,11 @@ _CSS = """
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: #0f172a; }
     ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+    /* dock the chat input inside the sidebar so it never overlaps the transcript */
+    section[data-testid="stSidebar"] { padding-bottom: 5.5rem; }
+    section[data-testid="stSidebar"] div[data-testid="stChatInput"] { padding-bottom: 0.6rem; }
+    div[data-testid="stChatInput"] textarea { font-size: 0.9rem; }
 
     /* responsive: keep everything usable on laptop / tablet / phone */
     @media (max-width: 1100px) {
@@ -651,6 +662,39 @@ def guess_currency(yf_symbol: str, exchange_key: str = "", market_key: str = "")
 def currency_display(currency: str) -> str:
     code = (currency or "USD").upper()
     return f"{CURRENCY_SYMBOLS.get(code, code + ' ')}{code}"
+
+
+def _shorten(text: Any, limit: int = 20) -> str:
+    """Trim a display label on a word boundary (used on heat-map tiles)."""
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    cut = value[:limit]
+    if " " in cut:
+        cut = cut[:cut.rfind(" ")]
+    return cut.rstrip(" ,.-–") + "…"
+
+
+# Sector labels for instruments the provider gives no sector for (crypto, futures,
+# FX, indices) so the heat map never shows an "Unclassified" blob for them.
+MARKET_SECTOR_FALLBACK: Dict[str, str] = {
+    "crypto": "Crypto",
+    "commodities": "Commodities",
+    "forex": "Forex",
+    "indices": "Indices",
+}
+
+
+def catalog_meta(yf_symbol: str) -> Dict[str, str]:
+    """Bundled name / sector / currency for a symbol, when the catalog knows it."""
+    raw = (yf_symbol or "").strip().upper()
+    item = MARKET_ITEMS_BY_NAME.get(raw)
+    if not item:
+        item = MARKET_ITEMS_BY_NAME.get(raw.split(".")[0])
+    if not item:
+        return {}
+    return {"name": item.get("name") or "", "sector": item.get("sector") or "",
+            "currency": item.get("currency") or ""}
 
 
 # ===========================================================================
@@ -1248,11 +1292,14 @@ class YahooProvider(MarketDataProvider):
             seen.add(token)
             yf_symbol = token if (any(token.endswith(s) for s in SUFFIX_CURRENCY) or token.startswith("^")
                                   or "-" in token or "=" in token) else f"{token}{suffix}"
+            meta = catalog_meta(yf_symbol)
             out.append({
                 "symbol": token.replace(suffix, "") if suffix and token.endswith(suffix) else token,
                 "yf_symbol": yf_symbol,
-                "name": token,
-                "currency": guess_currency(yf_symbol, exchange_key),
+                "name": meta.get("name") or token,
+                "name_source": "catalog" if meta.get("name") else "provider",
+                "sector": meta.get("sector") or "",
+                "currency": meta.get("currency") or guess_currency(yf_symbol, exchange_key),
                 "exchange": exchange_key,
                 "universe": universe.key,
                 "source": "live screener" if universe.kind.startswith("screener") else
@@ -1347,20 +1394,68 @@ def _download_ohlc(symbols: Sequence[str], period: str, interval: str) -> pd.Dat
         return pd.DataFrame()
 
 
-def _slice_symbol_frame(frame: pd.DataFrame, symbol: str, many: bool) -> pd.DataFrame:
-    if frame is None or frame.empty:
+CANONICAL_COLUMNS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
+
+
+def _clean_ohlc(frame: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
+    """
+    Flatten whatever column layout the provider returned into canonical OHLCV names.
+
+    WHY THIS EXISTS (the KeyError: 'Close' bug):
+    `yf.download([symbol], group_by="ticker")` returns MultiIndex columns
+    [('CL=F','Open'), ('CL=F','Close'), ...] even for a SINGLE symbol, while
+    `yf.download([a, b], ...)` also returns MultiIndex. The old code only unwrapped the
+    MultiIndex when more than one symbol was requested, so every single-instrument quote
+    (dashboard, watchlist, alerts, AI tools) hit `frame["Close"]` -> KeyError: 'Close'.
+    The layout is now normalized in one place, for every call, and a missing Close column
+    is reported as a clean provider message instead of an exception.
+    """
+    if frame is None or getattr(frame, "empty", True):
         return pd.DataFrame()
+    out = frame
     try:
-        if many:
-            if isinstance(frame.columns, pd.MultiIndex):
-                if symbol in frame.columns.get_level_values(0):
-                    return frame[symbol].dropna(how="all")
-                return pd.DataFrame()
-            return pd.DataFrame()
-        return frame.dropna(how="all")
+        if isinstance(out.columns, pd.MultiIndex):
+            picked = None
+            for level in range(out.columns.nlevels):
+                values = [str(v) for v in out.columns.get_level_values(level)]
+                if symbol and symbol in values:
+                    picked = out.xs(symbol, axis=1, level=level)
+                    break
+            if picked is None:
+                if symbol:
+                    # The caller asked for a specific symbol and it is not in this frame.
+                    # Returning the other symbols' columns here would silently show the
+                    # WRONG instrument's price, so report "no data" instead.
+                    return pd.DataFrame()
+                picked = out.copy()
+                picked.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in picked.columns]
+            out = picked
+        if isinstance(out.columns, pd.MultiIndex):     # still nested after xs()
+            out.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in out.columns]
+        rename: Dict[Any, str] = {}
+        for column in out.columns:
+            key = str(column).strip().lower()
+            for canonical in CANONICAL_COLUMNS:
+                if key == canonical.lower():
+                    rename[column] = canonical
+                    break
+        if rename:
+            out = out.rename(columns=rename)
+        out = out.loc[:, ~out.columns.duplicated()]     # keep the first Close, never a DataFrame
+        return out.dropna(how="all")
     except Exception as exc:
-        log_exception(f"slice {symbol}", exc)
+        log_exception(f"clean ohlc {symbol}", exc)
         return pd.DataFrame()
+
+
+def _slice_symbol_frame(frame: pd.DataFrame, symbol: str, many: bool = True) -> pd.DataFrame:
+    """One symbol's bars from a batch download - works for 1 symbol or N symbols."""
+    cleaned = _clean_ohlc(frame, symbol)
+    if cleaned.empty:
+        return cleaned
+    if "Close" not in cleaned.columns:
+        return pd.DataFrame()
+    return cleaned
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -1370,11 +1465,10 @@ def _quotes_cached(symbols: Tuple[str, ...], cache_buster: int) -> List[Dict[str
     if not symbols:
         return []
     frame = _download_ohlc(symbols, period="7d", interval="1d")
-    many = len(symbols) > 1
     rows: List[Dict[str, Any]] = []
     for symbol in symbols:
         try:
-            block = _slice_symbol_frame(frame, symbol, many)
+            block = _slice_symbol_frame(frame, symbol)
             exch_key = _exchange_for_yf_symbol(symbol)
             row: Dict[str, Any] = {
                 "symbol": symbol, "yf_symbol": symbol, "exchange": exch_key,
@@ -1385,7 +1479,14 @@ def _quotes_cached(symbols: Tuple[str, ...], cache_buster: int) -> List[Dict[str
                 row["error"] = "no rows returned"
                 rows.append(row)
                 continue
-            closes = pd.to_numeric(block["Close"], errors="coerce").dropna()
+            if "Close" not in block.columns:
+                row["error"] = "provider returned no Close column for this instrument"
+                rows.append(row)
+                continue
+            close_column = block["Close"]
+            if isinstance(close_column, pd.DataFrame):
+                close_column = close_column.iloc[:, 0]
+            closes = pd.to_numeric(close_column, errors="coerce").dropna()
             if closes.empty:
                 row["error"] = "close column empty"
                 rows.append(row)
@@ -1424,7 +1525,7 @@ def _history_fetch(yf_symbol: str, period: str, interval: str) -> pd.DataFrame:
     try:
         ticker = yf.Ticker(yf_symbol)
         frame = ticker.history(period=period, interval=interval, auto_adjust=False)
-        return frame if frame is not None else pd.DataFrame()
+        return _clean_ohlc(frame, yf_symbol)
     except Exception as exc:
         log_exception(f"history {yf_symbol}", exc)
         return pd.DataFrame()
@@ -1466,7 +1567,7 @@ def _exchange_for_yf_symbol(yf_symbol: str) -> str:
 
 def _profile_fetch(yf_symbol: str) -> Dict[str, Any]:
     """Name / sector / industry / market cap, best effort and fully guarded."""
-    out: Dict[str, Any] = {"name": "", "sector": "", "industry": "", "market_cap": None,
+    out: Dict[str, Any] = {"name": "", "long_name": "", "sector": "", "industry": "", "market_cap": None,
                            "currency": "", "quote_type": "", "exchange_name": ""}
     try:
         ticker = yf.Ticker(yf_symbol)
@@ -1477,6 +1578,7 @@ def _profile_fetch(yf_symbol: str) -> Dict[str, Any]:
             log_exception(f"info {yf_symbol}", exc)
         if isinstance(info, dict):
             out["name"] = info.get("shortName") or info.get("longName") or ""
+            out["long_name"] = info.get("longName") or info.get("shortName") or ""
             out["sector"] = info.get("sector") or info.get("sectorDisp") or ""
             out["industry"] = info.get("industry") or ""
             out["currency"] = (info.get("currency") or "").upper()
@@ -1523,7 +1625,12 @@ def enrich_profiles(rows: List[Dict[str, Any]], limit: int = 160, workers: int =
     for row, profile in zip(targets, results):
         if not isinstance(profile, dict):
             continue
-        row["name"] = profile.get("name") or row.get("name") or row.get("symbol")
+        provider_name = profile.get("name") or ""
+        # A curated label (e.g. "Gold" for GC=F) is kept as the short display name; the
+        # provider's longer legal name is preserved separately for the tooltip.
+        row["long_name"] = provider_name or row.get("name") or row.get("symbol")
+        if not (row.get("name_source") == "catalog" and row.get("name")):
+            row["name"] = provider_name or row.get("name") or row.get("symbol")
         row["sector"] = profile.get("sector") or row.get("sector") or ""
         row["industry"] = profile.get("industry") or ""
         row["market_cap"] = profile.get("market_cap")
@@ -1537,6 +1644,7 @@ def enrich_profiles(rows: List[Dict[str, Any]], limit: int = 160, workers: int =
         row.setdefault("sector", "")
         row.setdefault("market_cap", None)
         row.setdefault("name", row.get("symbol"))
+        row.setdefault("long_name", row.get("name"))
     return rows
 
 
@@ -1544,8 +1652,8 @@ def enrich_profiles(rows: List[Dict[str, Any]], limit: int = 160, workers: int =
 # SECTION 7 - NORMALIZED MARKET FRAME + DATA STATUS
 # ===========================================================================
 def _frame_columns() -> List[str]:
-    return ["symbol", "yf_symbol", "name", "sector", "industry", "exchange", "market", "currency",
-            "price", "previous_close", "change", "change_percent", "market_cap", "volume",
+    return ["symbol", "yf_symbol", "name", "long_name", "sector", "industry", "exchange", "market",
+            "currency", "price", "previous_close", "change", "change_percent", "market_cap", "volume",
             "day_high", "day_low", "open", "last_bar", "session_date", "data_status",
             "timestamp", "ok", "error", "source"]
 
@@ -1575,6 +1683,9 @@ def normalize_rows(rows: List[Dict[str, Any]], data_status: str, session_date: s
         record["market"] = exch.market if exch else "global"
         record["currency"] = (row.get("currency") or guess_currency(row.get("yf_symbol") or "", row.get("exchange") or "")).upper()
         record["name"] = row.get("name") or record["symbol"]
+        record["long_name"] = row.get("long_name") or record["name"]
+        if not record["sector"]:
+            record["sector"] = MARKET_SECTOR_FALLBACK.get(record["market"], "")
         cleaned.append(record)
     if not cleaned:
         return pd.DataFrame(columns=_frame_columns())
@@ -1806,87 +1917,14 @@ def breadth_52w(frame: pd.DataFrame, limit: int = 60) -> Dict[str, Any]:
 def build_heatmap_figure(frame: pd.DataFrame, size_mode: str = "Market cap",
                          color_mode: str = "% change", group_mode: str = "Sectors",
                          currency: str = "USD", max_tiles: int = 250):
-    """Reusable treemap engine: size / colour / grouping are all selectable."""
-    if frame is None or frame.empty:
-        return None
-    work = frame.copy()
-    work = work[work["price"].notna()]
-    if work.empty:
-        return None
-    work["change_percent"] = pd.to_numeric(work["change_percent"], errors="coerce").fillna(0.0)
-    work["market_cap"] = pd.to_numeric(work["market_cap"], errors="coerce")
-    work["volume"] = pd.to_numeric(work["volume"], errors="coerce").fillna(0.0)
-    if size_mode == "Market cap" and work["market_cap"].notna().any():
-        work["size_value"] = work["market_cap"].fillna(work["market_cap"].median() or 1.0).clip(lower=1.0)
-    elif size_mode == "Volume":
-        work["size_value"] = work["volume"].clip(lower=1.0)
-    else:
-        work["size_value"] = 1.0
-    work = work.sort_values("size_value", ascending=False).head(max_tiles)
-
-    if color_mode == "% change":
-        work["color_value"] = work["change_percent"]
-        cmin, cmax, unit = -3.0, 3.0, "%"
-    elif color_mode == "Volume":
-        values = work["volume"]
-        work["color_value"] = values
-        cmin, cmax, unit = float(values.min()), float(values.max()), ""
-    else:
-        work["color_value"] = work["change_percent"]
-        cmin, cmax, unit = -3.0, 3.0, "%"
-
-    if group_mode == "Sectors":
-        work["group"] = work["sector"].fillna("").replace("", "Unclassified")
-    elif group_mode == "Industries":
-        work["group"] = work["industry"].fillna("").replace("", "Unclassified")
-    else:
-        work["group"] = "All instruments"
-
-    groups = sorted(work["group"].unique().tolist())
-    labels: List[str] = []
-    parents: List[str] = []
-    values: List[float] = []
-    colors: List[float] = []
-    texts: List[str] = []
-    customs: List[List[Any]] = []
-
-    for _, row in work.iterrows():
-        labels.append(str(row["symbol"]))
-        parents.append(str(row["group"]))
-        values.append(float(row["size_value"]))
-        colors.append(float(row["color_value"]) if math.isfinite(float(row["color_value"])) else 0.0)
-        texts.append(f"{row['symbol']}<br>{fmt_price(row['price'], row['currency'])}<br>"
-                     f"{fmt_pct(row['change_percent'])}")
-        customs.append([row["name"], fmt_cap(row["market_cap"], row["currency"]), fmt_volume(row["volume"]),
-                        row["sector"] or "—", row["industry"] or "—", row["currency"],
-                        str(row["data_status"]), str(row["last_bar"] or "—")])
-    for group in groups:
-        members = work[work["group"] == group]
-        labels.append(str(group))
-        parents.append("")
-        values.append(float(members["size_value"].sum()))
-        colors.append(float(members["color_value"].mean()) if len(members) else 0.0)
-        texts.append(f"<b>{group}</b><br>{len(members)} names")
-        customs.append([group, "—", "—", group, "—", currency, "", ""])
-
-    fig = go.Figure(go.Treemap(
-        labels=labels, parents=parents, values=values, text=texts, textinfo="text",
-        customdata=customs,
-        marker=dict(
-            colors=colors, cmid=0.0, cmin=cmin, cmax=cmax,
-            colorscale=[[0.0, "#7f1d1d"], [0.25, "#b91c1c"], [0.5, "#1e293b"],
-                        [0.75, "#047857"], [1.0, "#065f46"]],
-            line=dict(width=1.5, color="#020617")),
-        hovertemplate=("<b>%{label}</b><br>Name: %{customdata[0]}<br>"
-                       "Market cap: %{customdata[1]}<br>Volume: %{customdata[2]}<br>"
-                       "Sector: %{customdata[3]}<br>Industry: %{customdata[4]}<br>"
-                       "Currency: %{customdata[5]}<br>Data status: %{customdata[6]}<br>"
-                       "Last bar: %{customdata[7]}<extra></extra>"),
-        root_color="#0F172A", branchvalues="total",
-    ))
-    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=560, paper_bgcolor="#0F172A",
-                      font=dict(color="#e2e8f0", size=12))
-    return fig
+    """UPGRADED (v3.1): delegates to the standalone `heatmap.py` module — tiles
+    coloured strictly by daily % change, labelled with ticker + FULL stock name."""
+    import heatmap as _heatmap_module
+    return _heatmap_module.build_heatmap_figure(frame, size_mode=size_mode,
+                                                color_mode=color_mode,
+                                                group_mode=group_mode,
+                                                currency=currency,
+                                                max_tiles=max_tiles)
 
 
 # ===========================================================================
@@ -2124,24 +2162,51 @@ def fetch_news(query: str, yf_symbol: str = "", limit: int = 20) -> Dict[str, An
             "ok": bool(combined), "fetched_at": datetime.now(timezone.utc).isoformat()}
 
 
-def news_sentiment(title: str) -> Dict[str, Any]:
-    """Simple keyword sentiment. Clearly a heuristic, and labelled as such in the UI."""
-    text = (title or "").lower()
-    bullish = ["surge", "rally", "beat", "beats", "growth", "record", "profit", "gain", "gains",
-               "strong", "expansion", "bullish", "rise", "rises", "high", "upbeat", "upgrade",
-               "outperform", "positive", "approval", "wins", "jump", "soar", "boost", "buyback",
-               "dividend", "order win", "partnership", "expansion"]
-    bearish = ["fall", "falls", "drop", "drops", "loss", "losses", "miss", "misses", "cut", "cuts",
-               "weak", "down", "decline", "crash", "fear", "bearish", "selloff", "sell-off",
-               "concern", "concerns", "downgrade", "probe", "fine", "penalty", "lawsuit", "fraud",
-               "default", "resign", "layoff", "layoffs", "slump", "plunge", "halt", "recall"]
-    score = 5.5
-    for keyword in bullish:
-        if keyword in text:
-            score += 0.55
-    for keyword in bearish:
-        if keyword in text:
-            score -= 0.55
+# Two lexicons: general business words plus market-specific event words
+# (results, guidance, fundraise, order book ...) so a headline like
+# "Q2 results beat estimates" is not scored Neutral just because it lacks the word "surge".
+GENERAL_BULLISH = ("surge", "rally", "beat", "beats", "growth", "record", "profit", "gain", "gains",
+                   "strong", "expansion", "bullish", "rise", "rises", "high", "upbeat", "upgrade",
+                   "outperform", "positive", "approval", "wins", "jump", "soar", "boost", "buyback",
+                   "dividend", "partnership", "recovery", "rebound", "optimism", "inflow", "buy")
+GENERAL_BEARISH = ("fall", "falls", "drop", "drops", "loss", "losses", "miss", "misses", "cut", "cuts",
+                   "weak", "down", "decline", "crash", "fear", "bearish", "selloff", "sell-off",
+                   "concern", "concerns", "downgrade", "probe", "fine", "penalty", "lawsuit", "fraud",
+                   "default", "resign", "layoff", "layoffs", "slump", "plunge", "halt", "recall",
+                   "sell", "outflow", "pessimism")
+MARKET_BULLISH = ("results beat", "beats estimates", "profit rises", "profit jumps", "revenue up",
+                  "margin expansion", "order win", "order book", "new order", "wins contract", "bags order",
+                  "fundraise", "fund raising", "capital raise", "qip", "ipo", "stake sale", "buyback",
+                  "bonus issue", "stock split", "target raised", "price target raised", "upgrade",
+                  "initiates coverage", "accumulate", "add rating", "all-time high", "52-week high",
+                  "capex", "expansion plan", "capacity addition", "approval received", "regulatory approval",
+                  "tie-up", "tie up", "joint venture", "acquisition", "to acquire", "demerger", "inflow")
+MARKET_BEARISH = ("results miss", "misses estimates", "profit falls", "profit drops", "revenue down",
+                  "margin pressure", "guidance cut", "cuts guidance", "target cut", "price target cut",
+                  "downgrade", "reduce rating", "block deal", "bulk deal", "promoter sells", "pledge",
+                  "insider selling", "auditor resigns", "delisting", "default", "insolvency", "bankruptcy",
+                  "regulatory action", "show-cause", "sebi probe", "tax raid", "penalty", "order cancelled",
+                  "contract terminated", "recall", "outage", "strike", "halt", "trading halt",
+                  "data breach", "impairment", "write-off", "writedown", "outflow")
+
+
+def _lexicon_hits(text: str, words: Iterable[str]) -> List[str]:
+    return [word for word in words if word in text]
+
+
+def news_sentiment(title: str, extra_text: str = "") -> Dict[str, Any]:
+    """
+    Keyword sentiment over a general + market-event lexicon. Deliberately transparent:
+    it is labelled a heuristic in the UI, and the matched words are returned so the
+    score can be audited. The news page's "Summary & impact" action adds a model read.
+    """
+    text = f"{title or ''} {extra_text or ''}".lower()
+    bullish = _lexicon_hits(text, GENERAL_BULLISH) + _lexicon_hits(text, MARKET_BULLISH)
+    bearish = _lexicon_hits(text, GENERAL_BEARISH) + _lexicon_hits(text, MARKET_BEARISH)
+    if not text.strip():
+        return {"score": None, "label": "No headline text", "colour": "#94a3b8",
+                "bullish_terms": [], "bearish_terms": []}
+    score = 5.5 + 0.55 * len(bullish) - 0.55 * len(bearish)
     score = max(1.5, min(9.5, round(score, 1)))
     if score >= 6.5:
         label, colour = "Bullish", "#34d399"
@@ -2149,7 +2214,8 @@ def news_sentiment(title: str) -> Dict[str, Any]:
         label, colour = "Bearish", "#f87171"
     else:
         label, colour = "Neutral", "#fbbf24"
-    return {"score": score, "label": label, "colour": colour}
+    return {"score": score, "label": label, "colour": colour,
+            "bullish_terms": bullish[:6], "bearish_terms": bearish[:6]}
 
 
 # ===========================================================================
@@ -2437,10 +2503,13 @@ def symbol_snapshot(yf_symbol: str) -> Dict[str, Any]:
     currency = (profile.get("currency") or quote.get("currency")
                 or guess_currency(yf_symbol, exchange_key)).upper()
     price = valid_price(quote.get("price"))
+    market_key = EXCHANGES[exchange_key].market if exchange_key in EXCHANGES else ""
+    sector = profile.get("sector") or MARKET_SECTOR_FALLBACK.get(market_key, "")
     return {
         "yf_symbol": yf_symbol,
         "symbol": yf_symbol,
-        "name": profile.get("name") or yf_symbol,
+        "name": profile.get("name") or catalog_meta(yf_symbol).get("name") or yf_symbol,
+        "long_name": profile.get("long_name") or profile.get("name") or yf_symbol,
         "exchange": exchange_key,
         "market": EXCHANGES[exchange_key].market if exchange_key in EXCHANGES else "global",
         "currency": currency,
@@ -2453,7 +2522,7 @@ def symbol_snapshot(yf_symbol: str) -> Dict[str, Any]:
         "open": valid_price(quote.get("open")),
         "volume": _num(quote.get("volume")),
         "market_cap": profile.get("market_cap"),
-        "sector": profile.get("sector") or "",
+        "sector": sector,
         "industry": profile.get("industry") or "",
         "last_bar": quote.get("last_bar") or "",
         "last_bar_date": quote.get("last_bar_date") or "",
@@ -3078,6 +3147,18 @@ def chat_generate(chat: ChatState, placeholder, user_text: str) -> str:
     return answer
 
 
+def _extract_json(text: str) -> str:
+    """Pull the first JSON object out of a model reply (handles ``` fences and prose)."""
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+        raw = re.sub(r"```\s*$", "", raw).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        return raw[start:end + 1]
+    return raw
+
+
 def ai_impact_summary(title: str, symbol: str, currency: str = "USD",
                       model_label: str = "") -> Optional[str]:
     """A real model call for the news 'Summary & impact' button (no canned text)."""
@@ -3219,6 +3300,37 @@ def candles_chart(yf_symbol: str, levels: Dict[str, Any], price: Optional[float]
 # ===========================================================================
 # SECTION 14 - PAGE: DASHBOARD
 # ===========================================================================
+def explain_quote_error(error: str) -> str:
+    """Turn a provider error string into a plain-language cause for the user."""
+    low = (error or "").lower()
+    if not error:
+        return "the provider returned nothing for this instrument"
+    if "close" in low:
+        return "the provider's response contained no close column for this instrument"
+    if "no rows" in low or "no data" in low or "empty" in low:
+        return "the provider returned no price bars for this instrument"
+    if "invalid price" in low or "zero" in low or "nan" in low:
+        return "the provider returned a zero or non-numeric price"
+    return error
+
+
+def market_cap_note(snapshot: Dict[str, Any]) -> str:
+    """Honest explanation for a missing market cap (futures/FX/crypto/indices have none)."""
+    if snapshot.get("market_cap"):
+        return ""
+    exchange_key = snapshot.get("exchange") or ""
+    symbol = str(snapshot.get("yf_symbol") or snapshot.get("symbol") or "")
+    if exchange_key == "CME" or symbol.endswith("=F"):
+        return "n/a — futures contracts have no market cap"
+    if exchange_key == "FX" or symbol.endswith("=X"):
+        return "n/a — FX pairs have no market cap"
+    if exchange_key == "CRYPTO" or symbol.endswith("-USD"):
+        return "n/a — crypto has no market cap from this provider"
+    if exchange_key == "GLOBAL" or symbol.startswith("^"):
+        return "n/a — index level, not a company"
+    return "not reported by the provider"
+
+
 def page_dashboard(refresh: bool) -> None:
     state = st.session_state
     with st.container(border=True):
@@ -3288,9 +3400,9 @@ def page_dashboard(refresh: bool) -> None:
                              snapshot.get("last_bar_date") or "", currency,
                              extra=f"{yf_symbol} · {snapshot.get('sector') or 'sector n/a'}")
         if not snapshot.get("ok"):
-            st.warning("No usable quote for this instrument right now"
-                       + (f" ({snapshot.get('error')})" if snapshot.get("error") else "")
-                       + ". Levels below, if any, come from the last available bars.")
+            st.warning(f"No usable quote for **{yf_symbol}** right now — "
+                       f"{explain_quote_error(snapshot.get('error'))}. "
+                       "Levels below, if any, come from the last available bars.")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.markdown(metric_html("Price", fmt_price(price, currency),
                                 change_class(snapshot.get("change_percent")),
@@ -3304,15 +3416,16 @@ def page_dashboard(refresh: bool) -> None:
                                 sub=f"rel-vol {indicators.get('relative_volume'):.2f}×"
                                     if indicators.get("relative_volume") else "rel-vol n/a"), unsafe_allow_html=True)
         c5.markdown(metric_html("Market cap", fmt_cap(snapshot.get("market_cap"), currency),
-                                sub=f"ATR {fmt_price(indicators.get('atr'), currency)}"), unsafe_allow_html=True)
+                                sub=market_cap_note(snapshot) or
+                                    f"ATR {fmt_price(indicators.get('atr'), currency)}"), unsafe_allow_html=True)
         st.markdown(f"<div class='card-sub' style='margin-top:8px'>{data_status_explanation(status)}</div>",
                     unsafe_allow_html=True)
 
     chart_col, plan_col = st.columns([3, 2])
     with chart_col:
         with st.container(border=True):
-            st.markdown(f"<div class='card-header'>{state.get('selected_symbol', '')} · Price action</div>",
-                        unsafe_allow_html=True)
+            st.markdown(f"<div class='card-header'>{_shorten(snapshot.get('name') or state.get('selected_symbol', ''), 34)}"
+                        f" · {state.get('selected_symbol', '')} · Price action</div>", unsafe_allow_html=True)
             figure, note = candles_chart(yf_symbol, levels, price, currency)
             st.markdown(f"<div class='card-sub'>{note}</div>", unsafe_allow_html=True)
             if figure is not None:
@@ -3469,10 +3582,13 @@ def page_news() -> None:
         state.news_open = None
 
     for index, item in enumerate(items):
-        sentiment = news_sentiment(item["title"])
+        sentiment = news_sentiment(item["title"], item.get("summary", ""))
+        score_text = sentiment["score"] if sentiment["score"] is not None else "–"
+        matched = (sentiment.get("bullish_terms") or []) + (sentiment.get("bearish_terms") or [])
+        audit = ("matched: " + ", ".join(matched[:4])) if matched else "no keyword matched"
         st.markdown(f"""
         <div style="background:#0B1220;border:1px solid rgba(51,65,85,0.5);border-radius:14px;padding:14px 16px;margin-bottom:8px;display:flex;gap:14px;align-items:flex-start;">
-            <div style="min-width:44px;height:44px;border-radius:12px;background:rgba(30,41,59,0.9);color:{sentiment['colour']};font-weight:700;font-size:1.05rem;display:flex;align-items:center;justify-content:center;">{sentiment['score']}</div>
+            <div style="min-width:44px;height:44px;border-radius:12px;background:rgba(30,41,59,0.9);color:{sentiment['colour']};font-weight:700;font-size:1.05rem;display:flex;align-items:center;justify-content:center;">{score_text}</div>
             <div style="flex:1;">
                 <div style="color:#f1f5f9;font-weight:600;font-size:0.95rem;line-height:1.35;">{html.escape(item['title'])}</div>
                 <div style="margin-top:6px;font-size:0.78rem;color:#64748b;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -3501,6 +3617,8 @@ def page_news() -> None:
 
         if state.news_open == index:
             with st.container(border=True):
+                st.markdown("<div class='card-sub'>Sentiment read</div>", unsafe_allow_html=True)
+                st.caption(f"Keyword heuristic: {score_text}/10 · {sentiment['label']} · {audit}")
                 st.markdown("<div class='card-sub'>Summary &amp; impact (generated by the configured AI model)</div>",
                             unsafe_allow_html=True)
                 chat_state = state.get("chat")
@@ -3869,15 +3987,25 @@ def render_chat_sidebar() -> None:
 
 
 def render_watchlist_sidebar() -> None:
+    """UPGRADED (v3.1): watchlist persists to JSON via WatchlistStore, shows
+    name + price + % change per row, and survives app restarts."""
     state = st.session_state
     st.markdown("##### 📋 Watchlist")
     new_ticker = st.text_input("Add instrument", placeholder="RELIANCE, AAPL, BTC-USD, ^NSEI",
                                key="watch_add_input")
-    if st.button("＋ Add", use_container_width=True, key="watch_add") and new_ticker.strip():
-        symbol = resolve_yf_symbol(new_ticker, state.get("market_key", "india"), state.get("exchange_key", ""))
-        if symbol and symbol not in state.watchlist:
-            state.watchlist.append(symbol)
-        st.rerun()
+    add_col, save_col = st.columns([2, 1])
+    with add_col:
+        if st.button("＋ Add", use_container_width=True, key="watch_add") and new_ticker.strip():
+            symbol = resolve_yf_symbol(new_ticker, state.get("market_key", "india"),
+                                       state.get("exchange_key", ""))
+            if symbol and symbol not in state.watchlist:
+                state.watchlist.append(symbol)
+                _WATCHLIST_STORE.save(list(state.watchlist))
+            st.rerun()
+    with save_col:
+        if st.button("💾 Save", use_container_width=True, key="watch_save"):
+            _WATCHLIST_STORE.save(list(state.watchlist))
+            st.toast("Watchlist saved.")
     if not state.watchlist:
         st.caption("Your watchlist is empty — add an instrument above.")
     for symbol in list(state.watchlist):
@@ -3885,8 +4013,11 @@ def render_watchlist_sidebar() -> None:
         currency = snapshot.get("currency") or "USD"
         left, right = st.columns([4, 1])
         with left:
-            label = (f"{symbol.replace('.NS', '').replace('.BO', '')}  "
-                     f"{fmt_price(snapshot.get('price'), currency)}  "
+            short = symbol.replace(".NS", "").replace(".BO", "").replace("^", "")
+            name = str(snapshot.get("name") or "")[:14]
+            label = (f"{short} · {name}  {fmt_price(snapshot.get('price'), currency)}  "
+                     f"{fmt_pct(snapshot.get('change_percent'))}") if name else \
+                    (f"{short}  {fmt_price(snapshot.get('price'), currency)}  "
                      f"{fmt_pct(snapshot.get('change_percent'))}")
             if st.button(label, key=f"watch_open_{symbol}", use_container_width=True):
                 state.selected_yf = symbol
@@ -3897,14 +4028,28 @@ def render_watchlist_sidebar() -> None:
         with right:
             if st.button("🗑", key=f"watch_del_{symbol}"):
                 state.watchlist = [s for s in state.watchlist if s != symbol]
+                _WATCHLIST_STORE.save(list(state.watchlist))
                 st.rerun()
-    st.caption("Prices are shown in each instrument's own currency.")
+    st.caption("Prices are shown in each instrument's own currency · 💾 saves the list to disk.")
 
 
 def render_alerts_sidebar() -> None:
+    """UPGRADED (v3.1): alerts use AlertEngine — de-duplication on create,
+    60-minute Telegram cooldown, manual re-arm, and rules persist to JSON."""
     state = st.session_state
     st.markdown("##### 🔔 Price alerts")
-    st.caption("Alerts are evaluated when this app reruns — they are not a background service.")
+    st.caption("Alerts are evaluated when this app reruns. A trigger sends ONE Telegram "
+               "message, then waits 60 minutes before it may notify again (re-armable).")
+
+    # hydrate persisted rules once per session
+    if not state.get("_alerts_hydrated"):
+        saved_watch, saved_alerts = _ALERT_ENGINE.load_state()
+        if saved_alerts and not state.alerts:
+            state.alerts = saved_alerts
+        if saved_watch and state.watchlist == _defaults["watchlist"]:
+            state.watchlist = saved_watch
+        state._alerts_hydrated = True
+
     symbol_input = st.text_input("Symbol", value=state.get("selected_symbol", ""), key="alert_symbol")
     selected_snapshot = symbol_snapshot(state.get("selected_yf", ""))
     default_price = clamp_number_input(selected_snapshot.get("price"), minimum=0.0, fallback=0.0)
@@ -3914,11 +4059,16 @@ def render_alerts_sidebar() -> None:
         if target > 0:
             resolved = resolve_yf_symbol(symbol_input, state.get("market_key", "india"),
                                          state.get("exchange_key", ""))
-            state.alerts.append({"symbol": resolved, "price": float(target), "direction": direction,
-                                 "notified": False, "created": datetime.now().isoformat()})
-            send_telegram(f"Alert set: {resolved} {direction} {target}")
-            st.success("Alert saved.")
-            st.rerun()
+            created, message = _ALERT_ENGINE.add(state.alerts, resolved, float(target), direction)
+            if created:
+                send_telegram(f"Alert set: {resolved} {direction} {target:g}",
+                              token=secret("TELEGRAM_BOT_TOKEN"), chat_id=secret("TELEGRAM_CHAT_ID"))
+                _ALERT_ENGINE.save_state(list(state.watchlist), list(state.alerts))
+                st.success("Alert saved." + ("" if secret("TELEGRAM_BOT_TOKEN")
+                                             else " (Telegram not configured — alert is in-app only.)"))
+                st.rerun()
+            else:
+                st.warning(message)
         else:
             st.warning("Enter a target price above zero (the provider may be returning 0.0 for this instrument).")
 
@@ -3929,36 +4079,60 @@ def render_alerts_sidebar() -> None:
         snapshot = symbol_snapshot(alert["symbol"])
         currency = snapshot.get("currency") or "USD"
         current = snapshot.get("price")
-        triggered = (current is not None and
-                     ((alert["direction"] == "Above" and current >= alert["price"]) or
-                      (alert["direction"] == "Below" and current <= alert["price"])))
+        triggered = _ALERT_ENGINE.is_triggered(alert, current)
         if triggered:
             st.warning(f"🔔 {alert['symbol']} {alert['direction']} "
                        f"{fmt_price(alert['price'], currency)} — now {fmt_price(current, currency)}")
-            if not alert.get("notified"):
-                if send_telegram(f"ALERT: {alert['symbol']} is {fmt_price(current, currency)} "
-                                 f"({alert['direction']} {fmt_price(alert['price'], currency)})"):
-                    state.alerts[index]["notified"] = True
+            if _ALERT_ENGINE.should_notify(alert):
+                sent = send_telegram(
+                    f"🔔 <b>ALERT</b> {alert['symbol']}\n"
+                    f"Now {fmt_price(current, currency)} ({fmt_pct(snapshot.get('change_percent'))})\n"
+                    f"Trigger: {alert['direction']} {fmt_price(alert['price'], currency)}",
+                    token=secret("TELEGRAM_BOT_TOKEN"), chat_id=secret("TELEGRAM_CHAT_ID"))
+                if sent:
+                    _ALERT_ENGINE.mark_notified(alert)
+                    _ALERT_ENGINE.save_state(list(state.watchlist), list(state.alerts))
+                    st.toast("Telegram notification sent.")
+                else:
+                    st.caption("Telegram send failed or is not configured — the alert stays armed.")
         else:
+            armed = "⏳ cooling down" if alert.get("notified") else "armed"
             st.write(f"{alert['symbol']} {alert['direction']} {fmt_price(alert['price'], currency)} · "
-                     f"now {fmt_price(current, currency)}")
-        if st.button("Remove", key=f"alert_remove_{index}"):
-            state.alerts.pop(index)
-            st.rerun()
+                     f"now {fmt_price(current, currency)} · {armed}")
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if alert.get("notified") and st.button("Re-arm", key=f"alert_rearm_{index}"):
+                _ALERT_ENGINE.rearm(alert)
+                _ALERT_ENGINE.save_state(list(state.watchlist), list(state.alerts))
+                st.rerun()
+        with btn_col2:
+            if st.button("Remove", key=f"alert_remove_{index}"):
+                state.alerts.pop(index)
+                _ALERT_ENGINE.save_state(list(state.watchlist), list(state.alerts))
+                st.rerun()
 
 
-def send_telegram(message: str) -> bool:
-    """Optional alert delivery. Silently unavailable unless both secrets exist."""
+# ---------------------------------------------------------------------------
+# UPGRADE (v3.1): Telegram + watchlist/alert persistence now live in the
+# reusable module `watchlist_alerts.py`. The token is NEVER hardcoded here —
+# it is read from st.secrets (Streamlit Cloud) or the environment / .env file.
+# ---------------------------------------------------------------------------
+from watchlist_alerts import AlertEngine, WatchlistStore, send_telegram  # noqa: E402
+
+_ALERT_ENGINE = AlertEngine(state_path=SNAPSHOT_FILE.parent / "terminal_state.json",
+                            cooldown_minutes=60)
+_WATCHLIST_STORE = WatchlistStore(state_path=SNAPSHOT_FILE.parent / "terminal_state.json")
+
+
+def telegram_status() -> str:
+    """Human-readable Telegram configuration status for the diagnostics page."""
     token, chat_id = secret("TELEGRAM_BOT_TOKEN"), secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return False
-    try:
-        response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                                 json={"chat_id": chat_id, "text": message}, timeout=10)
-        return response.status_code == 200
-    except Exception as exc:
-        log_exception("telegram send", exc)
-        return False
+    if token and chat_id:
+        return "configured (secrets)"
+    if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
+        return "configured (environment / .env)"
+    return "NOT configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in " \
+           ".streamlit/secrets.toml or a git-ignored .env file. NEVER in source code."
 
 
 def render_sidebar() -> None:
@@ -4021,6 +4195,8 @@ def page_diagnostics() -> None:
         st.dataframe(pd.DataFrame([{"Item": k.replace("_", " "), "Value": str(v)}
                                    for k, v in diagnostics.items()]),
                      use_container_width=True, hide_index=True)
+        st.markdown("##### Telegram notifications")
+        st.write(telegram_status())
         st.markdown("##### Market data provider")
         st.dataframe(pd.DataFrame([{"Capability": k, "Detail": v} for k, v in PROVIDER.capabilities().items()]),
                      use_container_width=True, hide_index=True)
