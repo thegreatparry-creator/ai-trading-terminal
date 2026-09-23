@@ -1,0 +1,7 @@
+streamlit==1.28.0
+yfinance==0.2.31
+pandas==2.1.0
+numpy==1.26.0
+plotly==5.17.0
+groq==0.4.2
+google-generativeai==0.3.1
