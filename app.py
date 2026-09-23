@@ -995,7 +995,10 @@ with tab_live:
                 )
         last = st.session_state.get("last_suggestion")
         if last:
-            st.error(last) if last.startswith("⚠️") else st.markdown(last)
+            if last.startswith("⚠️"):
+                st.error(last)
+            else:
+                st.markdown(last)
         else:
             st.caption("Tap the button to get an INTRADAY + SWING plan for this ticker.")
 
@@ -1052,7 +1055,15 @@ with tab_chat:
                                 messages=[
                                     {
                                         "role": "system",
-                                        "content": f"Trading assistant for {symbol}. Educational only. Context:\n{context}",
+                                        "content": (
+                                            f"You are a practical trading assistant for {symbol}. "
+                                            "Answer the user's question directly; do not start with a generic greeting. "
+                                            "Use the supplied market context when relevant, clearly separate facts from "
+                                            "inference, and do not invent live prices or news. For analysis requests, "
+                                            "organize the answer with key levels, scenario, risk, and invalidation when "
+                                            "the available data supports them. Keep the response concise. Educational only; "
+                                            f"Context:\n{context}"
+                                        ),
                                     },
                                     {"role": "user", "content": prompt},
                                 ],
@@ -1073,7 +1084,10 @@ with tab_chat:
                         answer = "⚠️ Invalid model selected."
                 except Exception as exc:
                     answer = f"⚠️ AI error: {type(exc).__name__}: {exc}"
-                st.error(answer) if answer.startswith("⚠️") else st.markdown(answer)
+                if answer.startswith("⚠️"):
+                    st.error(answer)
+                else:
+                    st.markdown(answer)
         st.session_state.chat_messages.append({"role": "assistant", "content": answer})
 
     if st.button("🗑️ Clear Chat"):
