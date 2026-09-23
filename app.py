@@ -343,21 +343,33 @@ def generate_levels(high: float, low: float, close: float) -> Dict:
 
 def gann_degree_levels(ref_price: float) -> Dict:
     """
-    Degree-Level Framework (Gann-style). 0° = reference price (first 15-min
-    closing candle of the session). Educational price references only.
+    Square-of-9 / Gann degree levels.
+
+    0° anchor = the first 15-minute candle close.
+    Resistance: (sqrt(anchor) + degree / 180)^2
+    Support:    (sqrt(anchor) - degree / 180)^2
     """
     if ref_price is None or ref_price <= 0:
         return {}
-    root = math.sqrt(ref_price)
-    step = 0.25  # 45 degrees
-    degrees = [0, 45, 90, 135, 180, 225, 270, 315, 360]
-    levels = {"_ref_close": ref_price, "_type": "gann_degree"}
-    for deg in degrees:
-        up = (root + step * (deg / 45.0)) ** 2
-        down = (root - step * (deg / 45.0)) ** 2
-        levels[f"U{deg}"] = up
-        levels[f"D{deg}"] = max(0.01, down)
-    levels["0"] = ref_price
+
+    anchor_sqrt = math.sqrt(float(ref_price))
+    degrees = [22.5, 45.0, 67.5, 90.0, 180.0]
+
+    levels = {
+        "_ref_close": float(ref_price),
+        "_type": "gann_sq9",
+        "0": float(ref_price),
+    }
+
+    for degree in degrees:
+        suffix = str(degree).rstrip("0").rstrip(".")
+
+        resistance = (anchor_sqrt + degree / 180.0) ** 2
+        support = max(0.01, (anchor_sqrt - degree / 180.0) ** 2)
+
+        levels[f"R{suffix}"] = resistance
+        levels[f"S{suffix}"] = support
+
     return levels
 
 
@@ -506,9 +518,17 @@ def build_quant_summary(yf_symbol: str, ref_price: float):
 
         anchor_price = ref_price or last_close
         anchor_sqrt = math.sqrt(abs(anchor_price)) if anchor_price else 0.0
-        step = 22.5 / 180
-        r225, r450, r900, r180 = ((anchor_sqrt + step * m) ** 2 for m in (1, 2, 4, 8))
-        s225, s450, s900, s180 = (max(0.01, (anchor_sqrt - step * m) ** 2) for m in (1, 2, 4, 8))
+        r225 = (anchor_sqrt + 22.5 / 180.0) ** 2
+r450 = (anchor_sqrt + 45.0 / 180.0) ** 2
+r675 = (anchor_sqrt + 67.5 / 180.0) ** 2
+r900 = (anchor_sqrt + 90.0 / 180.0) ** 2
+r180 = (anchor_sqrt + 180.0 / 180.0) ** 2
+
+s225 = max(0.01, (anchor_sqrt - 22.5 / 180.0) ** 2)
+s450 = max(0.01, (anchor_sqrt - 45.0 / 180.0) ** 2)
+s675 = max(0.01, (anchor_sqrt - 67.5 / 180.0) ** 2)
+s900 = max(0.01, (anchor_sqrt - 90.0 / 180.0) ** 2)
+s180 = max(0.01, (anchor_sqrt - 180.0 / 180.0) ** 2)
 
         closes = daily["Close"]
         fast_ema = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
@@ -539,8 +559,8 @@ def build_quant_summary(yf_symbol: str, ref_price: float):
 - Pre-Market High (PMH): {round(pre_market_high, 2)} | Pre-Market Low (PML): {round(pre_market_low, 2)}
 - Live Candle Pattern Detected: {candle_pattern}
 - Gann Anchor (1st 15m): {round(anchor_price, 2)} (sqrt: {round(anchor_sqrt, 4)})
-- Gann Resistances (R): 22.5°: {round(r225, 2)} | 45°: {round(r450, 2)} | 90°: {round(r900, 2)} | 180°: {round(r180, 2)}
-- Gann Supports (S): 22.5°: {round(s225, 2)} | 45°: {round(s450, 2)} | 90°: {round(s900, 2)} | 180°: {round(s180, 2)}
+- Gann Resistances (R): 22.5°: {round(r225, 2)} | 45°: {round(r450, 2)} | 67.5°: {round(r675, 2)} | 90°: {round(r900, 2)} | 180°: {round(r180, 2)}
+- Gann Supports (S): 22.5°: {round(s225, 2)} | 45°: {round(s450, 2)} | 67.5°: {round(s675, 2)} | 90°: {round(s900, 2)} | 180°: {round(s180, 2)}
 - Dynamic EMAs: Fast(9)={round(fast_ema, 2)} vs Slow(50)={round(slow_ema, 2)} ({ema_bias})
 - Golden Pocket: {round(fib_618, 2)} - {round(fib_500, 2)} | Wave Target ((B*C)/A): {round(wave_target, 2)}
 - Candle Exhaustion: {streak_signal}"""
@@ -731,7 +751,10 @@ with main_col:
             st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("<div class='card-header'>Degree Level Ladder (Gann Framework)</div>", unsafe_allow_html=True)
+        st.markdown(
+    "<div class='card-header'>Square-of-9 Gann Degree Ladder</div>",
+    unsafe_allow_html=True,
+)
         ref_note = levels.get('_ref_time', 'session') if levels else 'session'
         ref_px = levels.get('_ref_close', 0) if levels else 0
         st.markdown(
@@ -739,9 +762,29 @@ with main_col:
             unsafe_allow_html=True
         )
         if levels and levels.get("_type") == "gann_degree":
-            up_degrees = [360, 315, 270, 225, 180, 135, 90, 45]
-            for deg in up_degrees:
-                val = levels.get(f"U{deg}", 0)
+            gann_resistance_degrees = [180.0, 90.0, 67.5, 45.0, 22.5]
+
+for degree in gann_resistance_degrees:
+    suffix = str(degree).rstrip("0").rstrip(".")
+    val = levels.get(f"R{suffix}", 0.0)
+    pct = ((val - price) / price * 100) if price else 0.0
+
+    st.markdown(
+        f"""
+        <div class='level-row level-resistance'>
+            <span>
+                <b style='color:#f87171'>{degree:g}° R</b>
+                &nbsp; {format_price(val)}
+                &nbsp;
+                <span style='color:#64748b;font-size:0.75rem'>
+                    above 0° anchor
+                </span>
+            </span>
+            <span class='down'>{format_percent(pct)}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
                 pct = ((val - price) / price * 100) if price else 0
                 st.markdown(
                     f"<div class='level-row level-resistance'>"
@@ -756,9 +799,29 @@ with main_col:
                 f"<div style='font-size:1.15rem;font-weight:700;color:#f8fafc;margin-top:6px;'>Current price: {format_price(price)}</div></div>",
                 unsafe_allow_html=True
             )
-            down_degrees = [45, 90, 135, 180, 225, 270, 315, 360]
-            for deg in down_degrees:
-                val = levels.get(f"D{deg}", 0)
+            gann_support_degrees = [22.5, 45.0, 67.5, 90.0, 180.0]
+
+for degree in gann_support_degrees:
+    suffix = str(degree).rstrip("0").rstrip(".")
+    val = levels.get(f"S{suffix}", 0.0)
+    pct = ((val - price) / price * 100) if price else 0.0
+
+    st.markdown(
+        f"""
+        <div class='level-row level-support'>
+            <span>
+                <b style='color:#34d399'>{degree:g}° S</b>
+                &nbsp; {format_price(val)}
+                &nbsp;
+                <span style='color:#64748b;font-size:0.75rem'>
+                    below 0° anchor
+                </span>
+            </span>
+            <span class='up'>{format_percent(pct)}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
                 pct = ((val - price) / price * 100) if price else 0
                 st.markdown(
                     f"<div class='level-row level-support'>"
