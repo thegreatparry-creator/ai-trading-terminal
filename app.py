@@ -786,7 +786,6 @@ for level in ["4", "3", "2", "1"]:
     pivot_rows.append({"Resistance": r_val, "Support": s_val})
 levels_df = pd.DataFrame(pivot_rows, index=["Level 4", "Level 3", "Level 2", "Level 1"])
 st.dataframe(levels_df, use_container_width=True) 
-
         # ---------- AI SUGGESTIONS (right, beside live analysis) ----------
         with col_ai:
             st.subheader("💡 AI Trading Suggestions")
