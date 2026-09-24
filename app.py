@@ -1176,8 +1176,6 @@ def set_active_symbol(market: str, exchange: str, universe: str, symbol: str, di
     if changed:
         s.chat_messages = []          # chat is per-symbol: never show stale answers about another symbol
         s.ai_suggestion = None
-        s.news_open = None
-        s.news_impact = {}
         s._alert_prefill = True       # new-alert form re-fills on its next render
 
 
@@ -1878,14 +1876,68 @@ def page_heatmap() -> None:
 
 # ===========================================================================
 # ===========================================================================
-# SECTION 18a - STOCK NEWS + IMPACT (same robust News implementation as Script 1)
+# ===========================================================================
+# SECTION 18a - STOCK NEWS + IMPACT (Script 1 News implementation)
+# ===========================================================================
+# ===========================================================================
+# SECTION 9 - NEWS SERVICE (crash-proof parser)
+# ---------------------------------------------------------------------------
+# ROOT CAUSE OF THE ORIGINAL AttributeError (traceback line 945):
+#     link = n.get("link") or (n.get("content") or {}).get("clickThroughUrl", {}).get("url") or "#"
+# Yahoo returns BOTH shapes and sometimes junk:
+#     {"title", "publisher", "link", "providerPublishTime"}                      (legacy)
+#     {"id", "content": {"title", "provider": {"displayName"},
+#                        "clickThroughUrl": {"url"}, ...}}                       (current)
+# and `content` can be a str / list / None / int. Calling .get() on a str raised
+# AttributeError and killed the whole script.
+# Every field now goes through a typed accessor - one malformed article can
+# never take down the app, and missing pieces degrade to "—"/"#".
 # ===========================================================================
 def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _as_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        for entry in value:
+            text = _as_str(entry)
+            if text:
+                return text
+        return ""
+    if isinstance(value, dict):
+        for key in ("text", "title", "name", "url", "value"):
+            text = _as_str(value.get(key))
+            if text:
+                return text
+    return ""
+
+
+def _first_url(*candidates: Any) -> str:
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            for key in ("url", "href", "link"):
+                url = _as_str(candidate.get(key))
+                if url.startswith(("http://", "https://")):
+                    return url
+        elif isinstance(candidate, (list, tuple)):
+            nested = _first_url(*candidate)
+            if nested:
+                return nested
+        else:
+            url = _as_str(candidate)
+            if url.startswith(("http://", "https://")):
+                return url
+    return ""
+
+
 def safe_news_link(item: Any) -> str:
-    """Robustly extract a Yahoo/news article URL without ever raising."""
+    """The robust replacement for the line that crashed. Never raises."""
     if not isinstance(item, dict):
         return ""
     direct = _as_str(item.get("link"))
@@ -1908,7 +1960,6 @@ def safe_news_link(item: Any) -> str:
 
 
 def safe_news_image(item: Any) -> str:
-    """Robustly extract an article thumbnail when Yahoo supplies one."""
     if not isinstance(item, dict):
         return ""
     content = _as_dict(item.get("content"))
@@ -1926,33 +1977,14 @@ def safe_news_image(item: Any) -> str:
     return ""
 
 
-def _relative_age(published: Optional[datetime]) -> str:
-    if not isinstance(published, datetime):
-        return "time unknown"
-    now = datetime.now(timezone.utc)
-    if published.tzinfo is None:
-        published = published.replace(tzinfo=timezone.utc)
-    seconds = (now - published).total_seconds()
-    if seconds < 0:
-        return "just now"
-    if seconds < 3600:
-        return f"{max(1, int(seconds // 60))}m ago"
-    if seconds < 86400:
-        return f"{int(seconds // 3600)}h ago"
-    if seconds < 7 * 86400:
-        return f"{int(seconds // 86400)}d ago"
-    return published.strftime("%d %b %Y")
-
-
 def parse_news_items(raw: Any, symbol: str = "", limit: int = 20) -> List[Dict[str, Any]]:
-    """Normalize Yahoo Finance news payloads into safe, sortable article dictionaries."""
+    """Normalize ANY news payload into a list of safe dicts. Never raises."""
     if isinstance(raw, dict):
         candidates: Any = raw.get("news") or raw.get("items") or raw.get("data") or []
     else:
         candidates = raw
     if not isinstance(candidates, (list, tuple)):
         return []
-
     items: List[Dict[str, Any]] = []
     for entry in candidates:
         try:
@@ -1963,18 +1995,21 @@ def parse_news_items(raw: Any, symbol: str = "", limit: int = 20) -> List[Dict[s
                      or _as_str(content.get("headline")) or _as_str(entry.get("headline")))
             summary = (_as_str(entry.get("summary")) or _as_str(entry.get("description"))
                        or _as_str(content.get("summary")) or _as_str(content.get("description")))
-            provider = _as_dict(content.get("provider"))
             publisher = (_as_str(entry.get("publisher")) or _as_str(entry.get("provider"))
-                         or _as_str(provider.get("displayName")) or _as_str(provider.get("name"))
+                         or _as_str(_as_dict(content.get("provider")).get("displayName"))
+                         or _as_str(_as_dict(content.get("provider")).get("name"))
                          or _as_str(entry.get("source")) or "Unknown source")
             link = safe_news_link(entry)
             image = safe_news_image(entry)
             stamp = (entry.get("providerPublishTime") or entry.get("published")
                      or content.get("pubDate") or content.get("datePublished")
-                     or content.get("displayTime") or entry.get("pubDate") or entry.get("time"))
+                     or content.get("displayTime")
+                     or entry.get("pubDate") or entry.get("time"))
             published = None
             if isinstance(stamp, datetime):
-                # Important: yfinance/Yahoo can already return a datetime object.
+                # v3.1.1 FIX: already a normalized datetime (fetch_news re-parses
+                # its own parsed items) - the old int/float/str-only chain dropped
+                # it and every headline showed "time unknown".
                 published = stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
             elif isinstance(stamp, (int, float)):
                 try:
@@ -2005,10 +2040,9 @@ def parse_news_items(raw: Any, symbol: str = "", limit: int = 20) -> List[Dict[s
                 "age_label": _relative_age(published),
                 "symbol": symbol,
             })
-        except Exception as exc:
+        except Exception as exc:      # a single bad article is logged, never fatal
             log_exception("parse news item", exc)
             continue
-
     seen: set = set()
     unique: List[Dict[str, Any]] = []
     for item in items:
@@ -2021,9 +2055,32 @@ def parse_news_items(raw: Any, symbol: str = "", limit: int = 20) -> List[Dict[s
     return unique[:limit]
 
 
+def _relative_age(published: Optional[datetime]) -> str:
+    if not isinstance(published, datetime):
+        return "time unknown"
+    now = datetime.now(timezone.utc)
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    seconds = (now - published).total_seconds()
+    if seconds < 0:
+        return "just now"
+    if seconds < 3600:
+        return f"{max(1, int(seconds // 60))}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    if seconds < 7 * 86400:
+        return f"{int(seconds // 86400)}d ago"
+    return published.strftime("%d %b %Y")
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_news(query: str, yf_symbol: str = "", limit: int = 20) -> Dict[str, Any]:
-    """Real Yahoo news only: ticker.news first, Yahoo search second; never fabricate headlines."""
+    """
+    Real news only. Provider order:
+      1. yfinance ticker.news  (per-instrument)
+      2. Yahoo Finance search endpoint with newsCount (per query / per symbol)
+    If both are empty the UI says so - no fabricated headlines, ever.
+    """
     items: List[Dict[str, Any]] = []
     sources: List[str] = []
     errors: List[str] = []
@@ -2063,7 +2120,9 @@ def fetch_news(query: str, yf_symbol: str = "", limit: int = 20) -> Dict[str, An
             "ok": bool(combined), "fetched_at": datetime.now(timezone.utc).isoformat()}
 
 
-# Same transparent two-level lexicon used by Script 1.
+# Two lexicons: general business words plus market-specific event words
+# (results, guidance, fundraise, order book ...) so a headline like
+# "Q2 results beat estimates" is not scored Neutral just because it lacks the word "surge".
 GENERAL_BULLISH = ("surge", "rally", "beat", "beats", "growth", "record", "profit", "gain", "gains",
                    "strong", "expansion", "bullish", "rise", "rises", "high", "upbeat", "upgrade",
                    "outperform", "positive", "approval", "wins", "jump", "soar", "boost", "buyback",
@@ -2089,123 +2148,102 @@ MARKET_BEARISH = ("results miss", "misses estimates", "profit falls", "profit dr
                   "data breach", "impairment", "write-off", "writedown", "outflow")
 
 
-def news_impact_score(title: str, extra_text: str = "") -> Dict[str, Any]:
-    """Script 1's 1.5-9.5 transparent keyword score with matched-word audit."""
+def _lexicon_hits(text: str, words: Iterable[str]) -> List[str]:
+    return [word for word in words if word in text]
+
+
+def news_sentiment(title: str, extra_text: str = "") -> Dict[str, Any]:
+    """
+    Keyword sentiment over a general + market-event lexicon. Deliberately transparent:
+    it is labelled a heuristic in the UI, and the matched words are returned so the
+    score can be audited. The news page's "Summary & impact" action adds a model read.
+    """
     text = f"{title or ''} {extra_text or ''}".lower()
+    bullish = _lexicon_hits(text, GENERAL_BULLISH) + _lexicon_hits(text, MARKET_BULLISH)
+    bearish = _lexicon_hits(text, GENERAL_BEARISH) + _lexicon_hits(text, MARKET_BEARISH)
     if not text.strip():
         return {"score": None, "label": "No headline text", "colour": "#94a3b8",
                 "bullish_terms": [], "bearish_terms": []}
-    bull = [w for w in GENERAL_BULLISH + MARKET_BULLISH if w in text]
-    bear = [w for w in GENERAL_BEARISH + MARKET_BEARISH if w in text]
-    score = max(1.5, min(9.5, round(5.5 + 0.55 * len(bull) - 0.55 * len(bear), 1)))
-    label, colour = (("Bullish", "#34d399") if score >= 6.5 else
-                     ("Bearish", "#f87171") if score <= 4.5 else
-                     ("Neutral", "#fbbf24"))
+    score = 5.5 + 0.55 * len(bullish) - 0.55 * len(bearish)
+    score = max(1.5, min(9.5, round(score, 1)))
+    if score >= 6.5:
+        label, colour = "Bullish", "#34d399"
+    elif score <= 4.5:
+        label, colour = "Bearish", "#f87171"
+    else:
+        label, colour = "Neutral", "#fbbf24"
     return {"score": score, "label": label, "colour": colour,
-            "bullish_terms": bull[:6], "bearish_terms": bear[:6]}
+            "bullish_terms": bullish[:6], "bearish_terms": bearish[:6]}
 
 
-def ai_impact_summary(title: str, symbol: str, currency: str = "USD") -> Tuple[Optional[str], str]:
-    """Keep Script 2's verified Groq connection, but use Script 1's exact two-sentence prompt behavior."""
-    system = ("You are a concise financial news explainer. In exactly two short sentences: (1) what this headline "
-              "means, (2) how it could plausibly affect the named instrument. Hedge appropriately and never "
-              f"invent figures that are not in the headline. Prices for this instrument are quoted in {currency}. "
-              "Educational only, not advice.")
-    try:
-        return call_groq(system, [{"role": "user", "content": f"Headline: {title}\nInstrument: {symbol}"}],
-                         max_tokens=700, temperature=0.3), ""
-    except AIUnavailable as exc:
-        return None, str(exc)
-    except Exception as exc:
-        return None, friendly_ai_error(exc)
 
-
-def page_stock_news() -> None:
-    """Stock-specific News page matching Script 1's News UI and interaction path."""
+def page_news() -> None:
     state = st.session_state
     yf_symbol = state.get("active_symbol", "")
-    symbol = state.get("active_display_name") or display_name(yf_symbol)
-    currency = state.get("active_currency") or guess_currency(yf_symbol)
+    snapshot = {
+        "name": state.get("active_display_name") or yf_symbol,
+        "currency": state.get("active_currency") or "USD",
+    }
+    symbol = state.get("active_display_name") or (snapshot.get("name") or yf_symbol)
+    currency = snapshot.get("currency") or "USD"
 
     with st.container(border=True):
-        st.markdown(
-            "<div class='card-header'>News &amp; sentiment</div>"
-            "<div class='card-sub'>Headlines come straight from the configured provider. Nothing is invented — "
-            "when the provider returns nothing, this page says so.</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='card-header'>News &amp; sentiment</div>"
+                    "<div class='card-sub'>Headlines come straight from the configured provider. Nothing is invented — "
+                    "when the provider returns nothing, this page says so.</div>",
+                    unsafe_allow_html=True)
         col_a, col_b = st.columns([3, 1])
         with col_a:
-            topic = st.text_input(
-                "Search news",
-                value=symbol,
-                placeholder="e.g. Reliance Industries, semiconductor tariffs, RBI policy",
-                key="news_topic",
-            )
+            topic = st.text_input("Search news", value=snapshot.get("name") or symbol,
+                                  placeholder="e.g. Reliance Industries, semiconductor tariffs, RBI policy",
+                                  key="news_topic")
         with col_b:
             st.write("")
-            only_symbol = st.checkbox(
-                "Instrument feed only",
-                value=False,
-                key="news_instrument_only",
-                help="Query the instrument's own news feed instead of the free-text topic.",
-            )
+            only_symbol = st.checkbox("Instrument feed only", value=False, key="news_instrument_only",
+                                      help="Query the instrument's own news feed instead of the free-text topic.")
 
     query = yf_symbol if (only_symbol and yf_symbol) else (topic or yf_symbol)
     with st.spinner("Loading news…"):
         payload = fetch_news(query, "" if only_symbol else yf_symbol, limit=12)
     items = payload.get("items", [])
 
-    fetched_at = payload.get("fetched_at")
-    try:
-        fetched_label = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00")).strftime("%H:%M UTC")
-    except Exception:
-        fetched_label = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    st.markdown(
-        "<div class='card-sub'>"
-        + (f"Source: {', '.join(payload.get('sources', []))}" if payload.get("sources")
-           else "No provider source returned data")
-        + f" · fetched {fetched_label}</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<div class='card-sub'>"
+                + (f"Source: {', '.join(payload.get('sources', []))}" if payload.get("sources")
+                   else "No provider source returned data")
+                + f" · fetched {datetime.now(timezone.utc).strftime('%H:%M UTC')}</div>",
+                unsafe_allow_html=True)
 
     if not items:
-        st.info(
-            "No news available from the provider for this query right now. "
-            "This build never substitutes fabricated headlines."
-        )
+        st.info("No news available from the provider for this query right now. "
+                "This build never substitutes fabricated headlines.")
         if payload.get("errors"):
             with st.expander("Provider errors (technical)"):
                 st.code("\n".join(payload["errors"]))
         return
 
-    state.setdefault("news_open", None)
+    if "news_open" not in state:
+        state.news_open = None
     state.setdefault("news_impact", {})
 
     for index, item in enumerate(items):
-        sentiment = news_impact_score(item["title"], item.get("summary", ""))
+        sentiment = news_sentiment(item["title"], item.get("summary", ""))
         score_text = sentiment["score"] if sentiment["score"] is not None else "–"
         matched = (sentiment.get("bullish_terms") or []) + (sentiment.get("bearish_terms") or [])
         audit = ("matched: " + ", ".join(matched[:4])) if matched else "no keyword matched"
-
-        st.markdown(
-            f"""
-            <div style="background:#0B1220;border:1px solid rgba(51,65,85,0.5);border-radius:14px;padding:14px 16px;margin-bottom:8px;display:flex;gap:14px;align-items:flex-start;">
-                <div style="min-width:44px;height:44px;border-radius:12px;background:rgba(30,41,59,0.9);color:{sentiment['colour']};font-weight:700;font-size:1.05rem;display:flex;align-items:center;justify-content:center;">{score_text}</div>
-                <div style="flex:1;">
-                    <div style="color:#f1f5f9;font-weight:600;font-size:0.95rem;line-height:1.35;">{html.escape(item['title'])}</div>
-                    <div style="margin-top:6px;font-size:0.78rem;color:#64748b;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                        <span>{html.escape(item['publisher'])}</span><span>·</span><span>{item['age_label']}</span>
-                        <span style="background:rgba(148,163,184,0.14);color:{sentiment['colour']};padding:2px 9px;border-radius:999px;font-weight:600;font-size:0.72rem;">{sentiment['label']} (keyword heuristic)</span>
-                    </div>
+        st.markdown(f"""
+        <div style="background:#0B1220;border:1px solid rgba(51,65,85,0.5);border-radius:14px;padding:14px 16px;margin-bottom:8px;display:flex;gap:14px;align-items:flex-start;">
+            <div style="min-width:44px;height:44px;border-radius:12px;background:rgba(30,41,59,0.9);color:{sentiment['colour']};font-weight:700;font-size:1.05rem;display:flex;align-items:center;justify-content:center;">{score_text}</div>
+            <div style="flex:1;">
+                <div style="color:#f1f5f9;font-weight:600;font-size:0.95rem;line-height:1.35;">{html.escape(item['title'])}</div>
+                <div style="margin-top:6px;font-size:0.78rem;color:#64748b;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span>{html.escape(item['publisher'])}</span><span>·</span><span>{item['age_label']}</span>
+                    <span style="background:rgba(148,163,184,0.14);color:{sentiment['colour']};padding:2px 9px;border-radius:999px;font-weight:600;font-size:0.72rem;">{sentiment['label']} (keyword heuristic)</span>
                 </div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        </div>
+        """, unsafe_allow_html=True)
         if item.get("summary"):
             st.caption(item["summary"][:400])
-
         action_left, action_right = st.columns([1, 1])
         with action_left:
             if st.button("Summary & impact", key=f"news_sum_{index}", use_container_width=True):
@@ -2213,13 +2251,11 @@ def page_stock_news() -> None:
                 st.rerun()
         with action_right:
             if item.get("link"):
-                st.markdown(
-                    f"<a href='{html.escape(item['link'])}' target='_blank' rel='noopener' "
-                    "style='display:block;text-align:center;padding:0.4rem 0.6rem;border-radius:8px;"
-                    "background:#1E293B;border:1px solid rgba(51,65,85,0.6);color:#e2e8f0;"
-                    "text-decoration:none;font-size:0.85rem;'>Open full article ↗</a>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f"<a href='{item['link']}' target='_blank' rel='noopener' "
+                            f"style='display:block;text-align:center;padding:0.4rem 0.6rem;border-radius:8px;"
+                            f"background:#1E293B;border:1px solid rgba(51,65,85,0.6);color:#e2e8f0;"
+                            f"text-decoration:none;font-size:0.85rem;'>Open full article ↗</a>",
+                            unsafe_allow_html=True)
             else:
                 st.caption("No external link in the provider payload")
 
@@ -2227,29 +2263,20 @@ def page_stock_news() -> None:
             with st.container(border=True):
                 st.markdown("<div class='card-sub'>Sentiment read</div>", unsafe_allow_html=True)
                 st.caption(f"Keyword heuristic: {score_text}/10 · {sentiment['label']} · {audit}")
-                st.markdown(
-                    "<div class='card-sub'>Summary &amp; impact (generated by the configured AI model)</div>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown("<div class='card-sub'>Summary &amp; impact (generated by the configured AI model)</div>",
+                            unsafe_allow_html=True)
                 cache_key = f"{yf_symbol}|{item['title']}"
-                if cache_key not in state.news_impact:
-                    with st.spinner("AI is analysing this headline…"):
-                        state.news_impact[cache_key] = ai_impact_summary(
-                            item["title"], symbol or yf_symbol, currency
-                        )
-                text, err = state.news_impact[cache_key]
-                if text:
-                    st.markdown(text)
+                if cache_key not in state.get("news_impact", {}):
+                    state.news_impact[cache_key] = ai_impact_summary(
+                        item["title"], symbol or yf_symbol, currency
+                    )
+                summary, ai_error = state.news_impact[cache_key]
+                if summary:
+                    st.markdown(summary)
                     st.caption("Model-generated interpretation — not a verified fact about the company.")
                 else:
-                    st.warning(
-                        f"AI summary unavailable: {err or 'model not configured, or the provider returned an error.'}"
-                    )
-
-
-def page_news() -> None:
-    """News tab: Script 1-compatible stock-specific news feed."""
-    page_stock_news()
+                    st.warning(f"AI summary unavailable: {ai_error or 'model not configured, or the provider returned an error.'} "
+                               "The headline above is unchanged provider data.")
 
 
 # SECTION 18 - PAGE: GLOBAL NEWS
