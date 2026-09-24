@@ -2299,34 +2299,114 @@ def page_news() -> None:
 # SECTION 18 - PAGE: GLOBAL NEWS
 # ===========================================================================
 def page_global_news() -> None:
+    """Global feed using the exact same News & sentiment card/interaction system."""
+    state = st.session_state
+
     with st.container(border=True):
-        st.markdown("<div class='card-header'>🌍 Global market news</div>"
-                    "<div class='card-sub'>Scans every configured RSS source automatically · deduplicated · newest "
-                    "first · cached 5 minutes · market-wide news, NOT stock-specific</div>", unsafe_allow_html=True)
+        st.markdown("<div class='card-header'>News &amp; sentiment · Global market</div>"
+                    "<div class='card-sub'>Headlines come from the configured global RSS sources. "
+                    "Nothing is invented — newest headlines are deduplicated and shown with the same impact "
+                    "rating, Summary &amp; impact action, and article links as the stock News &amp; sentiment feed.</div>",
+                    unsafe_allow_html=True)
+
     with st.spinner("Scanning global news sources…"):
         data = fetch_global_news()
-    items, status = data.get("items", []), data.get("status", [])
-    ok = sum(1 for x in status if x["ok"])
-    st.caption(f"{len(items)} headlines · {ok}/{len(status)} sources responded · fetched "
-               f"{str(data.get('fetched_at', ''))[11:16]} UTC")
-    with st.expander("Source status"):
-        show_df(pd.DataFrame([{"Source": x["source"], "Articles": x["articles"],
-                               "Status": "OK" if x["ok"] else "Failed", "Detail": x["error"] or "—"}
-                              for x in status]))
+    items = data.get("items", [])
+    status = data.get("status", [])
+
+    ok = sum(1 for x in status if x.get("ok"))
+    st.markdown("<div class='card-sub'>"
+                f"Source status: {ok}/{len(status)} feeds responded"
+                f" · fetched {datetime.now(timezone.utc).strftime('%H:%M UTC')}</div>",
+                unsafe_allow_html=True)
+
     if not items:
-        st.warning("No news could be loaded from any source right now. Try again in a few minutes.")
+        st.warning("No news could be loaded from any global source right now. Try again in a few minutes.")
+        if status:
+            with st.expander("Source status / provider errors"):
+                show_df(pd.DataFrame([
+                    {"Source": x.get("source", ""),
+                     "Articles": x.get("articles", 0),
+                     "Status": "OK" if x.get("ok") else "Failed",
+                     "Detail": x.get("error") or "—"}
+                    for x in status
+                ]))
         return
-    for it in items[:40]:
-        sentiment = news_sentiment(it["title"], it.get("summary", ""))
-        tone = sentiment.get("label", "Neutral")
-        colour = sentiment.get("colour", "#fbbf24")
-        link = f" · <a href='{html.escape(it['link'])}' target='_blank' rel='noopener'>read ↗</a>" if it["link"] else ""
-        st.markdown(f"<div class='news-card'><b>{html.escape(it['title'])}</b>"
-                    f"<div class='card-sub' style='margin:4px 0 0 0'>{html.escape(it['source'])} · "
-                    f"{age_label(it['published'])} · <span style='color:{colour}'>{tone} (keyword heuristic)</span>"
-                    f"{link}</div></div>", unsafe_allow_html=True)
-        if it.get("summary"):
-            st.caption(it["summary"][:240])
+
+    state.setdefault("news_open", None)
+    state.setdefault("news_impact", {})
+
+    # Global news deliberately uses the same 0-10 heuristic, colour, badge,
+    # Summary & impact toggle, AI explanation and full-article link as page_news().
+    for index, item in enumerate(items[:40]):
+        sentiment = news_sentiment(item.get("title", ""), item.get("summary", ""))
+        score_text = sentiment["score"] if sentiment["score"] is not None else "–"
+        matched = (sentiment.get("bullish_terms") or []) + (sentiment.get("bearish_terms") or [])
+        audit = ("matched: " + ", ".join(matched[:4])) if matched else "no keyword matched"
+        publisher = item.get("source") or "Unknown source"
+        published = item.get("published")
+        age = age_label(published)
+
+        st.markdown(f"""
+        <div style="background:#0B1220;border:1px solid rgba(51,65,85,0.5);border-radius:14px;padding:14px 16px;margin-bottom:8px;display:flex;gap:14px;align-items:flex-start;">
+            <div style="min-width:44px;height:44px;border-radius:12px;background:rgba(30,41,59,0.9);color:{sentiment['colour']};font-weight:700;font-size:1.05rem;display:flex;align-items:center;justify-content:center;">{score_text}</div>
+            <div style="flex:1;">
+                <div style="color:#f1f5f9;font-weight:600;font-size:0.95rem;line-height:1.35;">{html.escape(item.get('title', ''))}</div>
+                <div style="margin-top:6px;font-size:0.78rem;color:#64748b;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span>{html.escape(publisher)}</span><span>·</span><span>{html.escape(age)}</span>
+                    <span style="background:rgba(148,163,184,0.14);color:{sentiment['colour']};padding:2px 9px;border-radius:999px;font-weight:600;font-size:0.72rem;">{sentiment['label']} (keyword heuristic)</span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if item.get("summary"):
+            st.caption(str(item["summary"])[:400])
+
+        action_left, action_right = st.columns([1, 1])
+        with action_left:
+            if st.button("Summary & impact", key=f"global_news_sum_{index}", use_container_width=True):
+                state.news_open = index if state.news_open != index else None
+                st.rerun()
+        with action_right:
+            link = item.get("link") or ""
+            if link:
+                st.markdown(f"<a href='{html.escape(link)}' target='_blank' rel='noopener' "
+                            f"style='display:block;text-align:center;padding:0.4rem 0.6rem;border-radius:8px;"
+                            f"background:#1E293B;border:1px solid rgba(51,65,85,0.6);color:#e2e8f0;"
+                            f"text-decoration:none;font-size:0.85rem;'>Open full article ↗</a>",
+                            unsafe_allow_html=True)
+            else:
+                st.caption("No external link in the provider payload")
+
+        if state.news_open == index:
+            with st.container(border=True):
+                st.markdown("<div class='card-sub'>Sentiment read</div>", unsafe_allow_html=True)
+                st.caption(f"Keyword heuristic: {score_text}/10 · {sentiment['label']} · {audit}")
+                st.markdown("<div class='card-sub'>Summary &amp; impact (generated by the configured AI model)</div>",
+                            unsafe_allow_html=True)
+
+                cache_key = f"global|{item.get('title', '')}"
+                if cache_key not in state.get("news_impact", {}):
+                    with st.spinner("AI is analysing this headline…"):
+                        state.news_impact[cache_key] = ai_impact_summary(
+                            item.get("title", ""), "Global markets", "USD"
+                        )
+                summary, ai_error = state.news_impact[cache_key]
+                if summary:
+                    st.markdown(summary)
+                    st.caption("Model-generated interpretation — not a verified fact about the market.")
+                else:
+                    st.warning(f"AI summary unavailable: {ai_error or 'model not configured, or the provider returned an error.'} "
+                               "The headline above is unchanged provider data.")
+
+    if status:
+        with st.expander("Source status"):
+            show_df(pd.DataFrame([
+                {"Source": x.get("source", ""), "Articles": x.get("articles", 0),
+                 "Status": "OK" if x.get("ok") else "Failed", "Detail": x.get("error") or "—"}
+                for x in status
+            ]))
 
 
 # ===========================================================================
