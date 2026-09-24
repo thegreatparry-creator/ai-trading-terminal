@@ -1810,7 +1810,9 @@ def page_live() -> None:
         if not items:
             st.info("No headlines could be loaded right now (see the Global News page for feed status).")
         for it in items:
-            tone, colour = news_sentiment(it["title"])
+            sentiment = news_sentiment(it["title"], it.get("summary", ""))
+            tone = sentiment.get("label", "Neutral")
+            colour = sentiment.get("colour", "#fbbf24")
             link = f"<a href='{html.escape(it['link'])}' target='_blank' rel='noopener'>open ↗</a>" if it["link"] else ""
             st.markdown(f"<div class='news-card'><b>{html.escape(it['title'])}</b><div class='card-sub' "
                         f"style='margin:4px 0 0 0'>{html.escape(it['source'])} · {age_label(it['published'])} · "
@@ -2177,6 +2179,21 @@ def news_sentiment(title: str, extra_text: str = "") -> Dict[str, Any]:
 
 
 
+
+def ai_impact_summary(title: str, symbol: str, currency: str = "USD") -> Tuple[Optional[str], str]:
+    """Keep Script 2's verified Groq connection, but use Script 1's exact two-sentence prompt behavior."""
+    system = ("You are a concise financial news explainer. In exactly two short sentences: (1) what this headline "
+              "means, (2) how it could plausibly affect the named instrument. Hedge appropriately and never "
+              f"invent figures that are not in the headline. Prices for this instrument are quoted in {currency}. "
+              "Educational only, not advice.")
+    try:
+        return call_groq(system, [{"role": "user", "content": f"Headline: {title}\nInstrument: {symbol}"}],
+                         max_tokens=700, temperature=0.3), ""
+    except AIUnavailable as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, friendly_ai_error(exc)
+
 def page_news() -> None:
     state = st.session_state
     yf_symbol = state.get("active_symbol", "")
@@ -2300,7 +2317,9 @@ def page_global_news() -> None:
         st.warning("No news could be loaded from any source right now. Try again in a few minutes.")
         return
     for it in items[:40]:
-        tone, colour = news_sentiment(it["title"])
+        sentiment = news_sentiment(it["title"], it.get("summary", ""))
+        tone = sentiment.get("label", "Neutral")
+        colour = sentiment.get("colour", "#fbbf24")
         link = f" · <a href='{html.escape(it['link'])}' target='_blank' rel='noopener'>read ↗</a>" if it["link"] else ""
         st.markdown(f"<div class='news-card'><b>{html.escape(it['title'])}</b>"
                     f"<div class='card-sub' style='margin:4px 0 0 0'>{html.escape(it['source'])} · "
